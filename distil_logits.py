@@ -13,16 +13,14 @@ config = {
     "dataset": {
         "name": "mlabonne/FineTome-100k",
         "split": "train",
-        # "num_samples": , # You can pass a number here to limit the number of samples to use.
         "seed": 42
     },
     "models": {
-        "teacher": "arcee-ai/Arcee-Spark",
         "student": "Qwen/Qwen2-1.5B"
     },
     "tokenizer": {
         "max_length": 4096,
-        "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' }}{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+        "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ 'system\nYou are a helpful assistant.\n' }}{% endif %}{{'' + message['role'] + '\n' + message['content'] + '' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ 'assistant\n' }}{% endif %}"
     },
     "training": {
         "output_dir": "./results",
@@ -35,7 +33,7 @@ config = {
         "weight_decay": 0.05,
         "warmup_ratio": 0.1,
         "lr_scheduler_type": "cosine",
-        "resume_from_checkpoint": None,  # Set to a path or True to resume from the latest checkpoint
+        "resume_from_checkpoint": None,
         "fp16": False,
         "bf16": True
     },
@@ -46,9 +44,6 @@ config = {
     "model_config": {
         "use_flash_attention": True
     }
-    # "spectrum": {
-    #     "layers_to_unfreeze": "/workspace/spectrum/snr_results_Qwen-Qwen2-1.5B_unfrozenparameters_50percent.yaml" # You can pass a spectrum yaml file here to freeze layers identified by spectrum.
-    # }
 }
 
 # Set up environment
@@ -63,7 +58,6 @@ if "num_samples" in config["dataset"]:
     dataset = dataset.select(range(config["dataset"]["num_samples"]))
 
 # Load tokenizers
-teacher_tokenizer = AutoTokenizer.from_pretrained(config["models"]["teacher"])
 student_tokenizer = AutoTokenizer.from_pretrained(config["models"]["student"])
 
 # Apply chat template to student tokenizer
@@ -87,7 +81,7 @@ def sharegpt_format(example):
         message.insert(0, {"role": "system", "content": "You are a helpful assistant."})
 
     text = student_tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
-    return {"text": text}
+    return {"text": text, "logits": example["logits"]}
 
 # Preprocess and tokenize the dataset
 print("Preprocessing and tokenizing dataset...")
@@ -95,7 +89,9 @@ original_columns = dataset.column_names
 dataset = dataset.map(sharegpt_format, remove_columns=original_columns)
 
 def tokenize_function(examples):
-    return student_tokenizer(examples["text"], truncation=True, max_length=config["tokenizer"]["max_length"], padding="max_length")
+    tokenized = student_tokenizer(examples["text"], truncation=True, max_length=config["tokenizer"]["max_length"], padding="max_length")
+    tokenized["logits"] = examples["logits"]
+    return tokenized
 
 tokenized_dataset = dataset.map(tokenize_function, batched=True, num_proc=8, remove_columns=["text"])
 tokenized_dataset = tokenized_dataset.train_test_split(test_size=0.1)
@@ -107,7 +103,6 @@ model_kwargs = {"torch_dtype": torch.bfloat16}
 if config["model_config"]["use_flash_attention"]:
     model_kwargs["attn_implementation"] = "flash_attention_2"
 
-teacher_model = AutoModelForCausalLM.from_pretrained(config["models"]["teacher"], **model_kwargs)
 student_model = AutoModelForCausalLM.from_pretrained(config["models"]["student"], **model_kwargs)
 
 # Optionally freeze layers of the student model based on spectrum configuration
@@ -138,16 +133,13 @@ def pad_logits(student_logits, teacher_logits):
 class LogitsTrainer(SFTTrainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         inputs = {k: v.to(model.device) if hasattr(v, 'to') else v for k, v in inputs.items()}
-        self.teacher_model = self.teacher_model.to(model.device)
         
         student_model = model.module if hasattr(model, 'module') else model
-        teacher_model = self.teacher_model.module if hasattr(self.teacher_model, 'module') else self.teacher_model
 
         student_outputs = student_model(**inputs)
-        with torch.no_grad():
-            teacher_outputs = teacher_model(**inputs)
+        teacher_logits = inputs["logits"]
 
-        custom_loss = self.distillation_loss(student_outputs.logits, teacher_outputs.logits, inputs, student_outputs.loss)
+        custom_loss = self.distillation_loss(student_outputs.logits, teacher_logits, inputs, student_outputs.loss)
         return (custom_loss, student_outputs) if return_outputs else custom_loss
 
     def distillation_loss(self, student_logits, teacher_logits, inputs, original_loss):
@@ -176,9 +168,6 @@ trainer = LogitsTrainer(
     args=training_arguments,
     max_seq_length=config["tokenizer"]["max_length"],
 )
-
-# Add the teacher model to the trainer
-trainer.teacher_model = teacher_model
 
 # Prepare for distributed training
 trainer = accelerator.prepare(trainer)
