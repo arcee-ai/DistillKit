@@ -129,17 +129,13 @@ Follow the prompts to configure your desired setup.
 
 We provide sample DeepSpeed configuration files in the `./deepspeed_configs` directory. These configurations are shamelessly stolen from the Axolotl (thanks to Wing Lian and the Axolotl team for their excellent work!).
 
-To use a specific DeepSpeed configuration, you can specify it when launching your script:
-
-```bash
-accelerate launch --config_file path/to/deepspeed_config.yaml distil_logits.py
-```
+To use a specific DeepSpeed configuration, you can specify it in your accelerate config.
 
 ## Distillation Methods
 
 DistillKit supports two primary distillation methods:
 
-1. **Logit-based Distillation**: This method transfers knowledge from a larger teacher model to a smaller student model by using both hard targets (actual labels) and soft targets (teacher logits). The soft target loss, computed using Kullback-Leibler (KL) divergence, encourages the student to mimic the teacher's output distribution. This method enhances the student model's generalization and efficiency while maintaining performance close to the teacher model.
+1. **Logit-based Distillation**: This method transfers knowledge from a larger teacher model to a smaller student model by using both hard targets (actual labels) and soft targets (teacher logits). The soft target loss, computed using Kullback-Leibler (KL) divergence, encourages the student to mimic the teacher's output distribution. This method enhances the student model's generalization and efficiency while maintaining performance closer to the teacher model.
 
 2. **Hidden States-based Distillation**: This method involves transferring knowledge by aligning the intermediate layer representations of the student model with those of the teacher model. This process enhances the student's learning by providing richer, layer-wise guidance, improving its performance and generalization. This method allows for cross-architecture distillation, providing flexibility in model architecture choices.
 
