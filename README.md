@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="https://i.ibb.co/BL62pGD/Distill-Kit-Arcee.png" alt="DistillKit by Arcee.AI">
-</p>
+# DistillKit
 
 ## Overview
 
