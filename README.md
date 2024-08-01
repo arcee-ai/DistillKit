@@ -6,8 +6,8 @@ DistillKit is an open-source research effort in model distillation by Arcee.AI. 
 
 ## Features
 
-- Logit-based Distillation
-- Hidden States-based Distillation
+- Logit-based Distillation (models must be the same architecture)
+- Hidden States-based Distillation (models can be different architectures)
 - Support for Supervised Fine-Tuning (SFT) - DPO and CPT to come at a later date.
 
 
