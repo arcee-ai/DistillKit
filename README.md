@@ -1,5 +1,8 @@
 # DistillKit
 
+[Technical Report](https://arcee-ai-distillkit.my.canva.site/)
+
+
 ## Overview
 
 DistillKit is an open-source research effort in model distillation by Arcee.AI. Our goal is to provide the community with easy-to-use tools for researching, exploring, and enhancing the adoption of open-source Large Language Model (LLM) distillation methods. This release focuses on practical, effective techniques for improving model performance and efficiency.
