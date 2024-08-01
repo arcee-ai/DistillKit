@@ -8,8 +8,8 @@ DistillKit is an open-source research effort in model distillation by Arcee.AI. 
 
 - Logit-based Distillation
 - Hidden States-based Distillation
-- Support for Supervised Fine-Tuning (SFT) in distillation routines
-- Flexible configuration options
+- Support for Supervised Fine-Tuning (SFT) - DPO and CPT to come at a later date.
+
 
 ## Installation
 
@@ -124,7 +124,7 @@ Follow the prompts to configure your desired setup.
 
 ### DeepSpeed Configurations
 
-We provide sample DeepSpeed configuration files in the `./deepspeed_configs` directory. These configurations are adapted from the Axolotl project (thanks to Wing Lian and the Axolotl team for their excellent work!).
+We provide sample DeepSpeed configuration files in the `./deepspeed_configs` directory. These configurations are shamelessly stolen from the Axolotl (thanks to Wing Lian and the Axolotl team for their excellent work!).
 
 To use a specific DeepSpeed configuration, you can specify it when launching your script:
 
@@ -152,7 +152,11 @@ Our experiments have shown promising results in both general-purpose and domain-
 - Significant performance gains were observed when distilling models for domain-specific tasks.
 - Using the same training dataset for distillation as was used for the teacher model can lead to higher performance gains.
 
-For detailed results and analysis, please refer to our case studies and experimental results in the documentation.
+For detailed results and analysis, please refer to our case studies and experimental here.
+
+## Arcee-Labs
+
+This release marks the debut of Arcee-Labs, a division of Arcee.ai dedicated to accelerating open-source research. Our mission is to rapidly deploy resources, models, and research findings to empower both Arcee and the wider community. In an era of increasingly frequent breakthroughs in LLM research, models, and techniques, we recognize the need for agility and adaptability. Through our efforts, we strive to significantly contribute to the advancement of open-source AI technology and support the community in keeping pace with these rapid developments.
 
 ## Future Directions
 
@@ -162,16 +166,11 @@ We are excited to see how the community will use and improve DistillKit. Future 
 
 We welcome contributions from the community! If you have ideas for improvements, new features, or bug fixes, please feel free to open an issue or submit a pull request.
 
-## License
-
-[Insert appropriate license information here]
-
 ## Contact
 
-For more information about Arcee.AI and our projects, visit our website at [https://arcee.ai](https://arcee.ai).
+For more information about Arcee.AI and our training platform, visit our website at [https://arcee.ai](https://arcee.ai).
 
-For technical questions or support, please open an issue in this repository or contact our support team at [Insert appropriate contact information].
-
+For technical questions or support, please open an issue in this repository.
 ## Acknowledgments
 
-We would like to thank the open-source community and all contributors who have helped make DistillKit possible.
+While our work is ultimately quite different - this project was inspired by [Towards Cross-Tokenizer Distillation: the Universal Logit Distillation Loss for LLMs](https://arxiv.org/abs/2402.12030). We thank the authors for their effots and contributions. We would like to thank the open-source community and all at arcee.ai who have helped make DistillKit possible. We're just getting started.
