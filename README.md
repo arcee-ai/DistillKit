@@ -1,6 +1,7 @@
 <div align="center">
-  <img src="https://i.ibb.co/BL62pGD/Distill-Kit-Arcee.png" alt="DistillKit" style="border-radius: 10px; box-shadow: 0 4px 8px 0 rgba(0, 0, 0, 0.2), 0 6px 20px 0 rgba(0, 0, 0, 0.19); max-width: 100%; height: auto;">
+  <img src="https://i.ibb.co/BL62pGD/Distill-Kit-Arcee.png" alt="DistillKit" width="600" height="auto">
 </div>
+
 
 ## Overview
 
