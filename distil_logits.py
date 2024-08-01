@@ -135,7 +135,7 @@ def pad_logits(student_logits, teacher_logits):
         return (torch.cat([student_logits, pad_tensor], dim=-1), teacher_logits) if student_size < teacher_size else (student_logits, torch.cat([teacher_logits, pad_tensor], dim=-1))
     return student_logits, teacher_logits
 
-class CustomSFTTrainer(SFTTrainer):
+class LogitsTrainer(SFTTrainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         inputs = {k: v.to(model.device) if hasattr(v, 'to') else v for k, v in inputs.items()}
         self.teacher_model = self.teacher_model.to(model.device)
@@ -168,7 +168,7 @@ class CustomSFTTrainer(SFTTrainer):
 training_arguments = TrainingArguments(**config["training"])
 
 # Create the custom SFT Trainer
-trainer = CustomSFTTrainer(
+trainer = LogitsTrainer(
     model=student_model,
     train_dataset=tokenized_dataset["train"],
     eval_dataset=tokenized_dataset["test"],
