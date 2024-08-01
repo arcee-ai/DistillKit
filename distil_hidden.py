@@ -27,7 +27,7 @@ config = {
     "training": {
         "output_dir": "./results",
         "num_train_epochs": 3,
-        "per_device_train_batch_size": 2,
+        "per_device_train_batch_size": 1,
         "gradient_accumulation_steps": 8,
         "save_steps": 1000,
         "logging_steps": 2,
