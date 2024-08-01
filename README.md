@@ -53,7 +53,7 @@ For simplicity, we've set the config settings directly within the training scrip
 config = {
     "project_name": "distil-logits",
     "dataset": {
-        "name": "mlabonne/FineTome-100k",
+        "name": "mlabonne/FineTome-100k", # Only sharegpt format is currently supported.
         "split": "train",
         # "num_samples": , # You can pass a number here to limit the number of samples to use.
         "seed": 42
