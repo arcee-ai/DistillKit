@@ -1,7 +1,7 @@
 import os
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from trl import SFTTrainer, SFTConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from accelerate import Accelerator
@@ -14,7 +14,8 @@ config = {
         "name": "mlabonne/FineTome-100k",
         "split": "train",
         # "num_samples": , # You can pass a number here to limit the number of samples to use.
-        "seed": 42
+        "seed": 42,
+        "logits_save_path": "path/to/save/logits_dataset"  # Add this line
     },
     "models": {
         "teacher": "arcee-ai/Arcee-Spark",
@@ -41,7 +42,8 @@ config = {
     },
     "distillation": {
         "temperature": 2.0,
-        "alpha": 0.5
+        "alpha": 0.5,
+        "precompute_logits": True  # Add this line
     },
     "model_config": {
         "use_flash_attention": True
@@ -98,9 +100,6 @@ def tokenize_function(examples):
     return student_tokenizer(examples["text"], truncation=True, max_length=config["tokenizer"]["max_length"], padding="max_length")
 
 tokenized_dataset = dataset.map(tokenize_function, batched=True, num_proc=8, remove_columns=["text"])
-tokenized_dataset = tokenized_dataset.train_test_split(test_size=0.1)
-
-print("Dataset preparation complete. Loading models...")
 
 # Load models with configurable flash attention
 model_kwargs = {"torch_dtype": torch.bfloat16}
@@ -127,6 +126,32 @@ if "spectrum" in config and "layers_to_unfreeze" in config["spectrum"]:
 else:
     print("Spectrum configuration not found. All layers of the student model will be trainable.")
 
+
+# Precompute logits if configured to do so
+if config["distillation"]["precompute_logits"]:
+    print("Generating teacher logits...")
+    with torch.no_grad():
+        teacher_logits = []
+        for batch in tokenized_dataset:
+            input_ids = batch['input_ids'].to(device)
+            outputs = teacher_model(input_ids=input_ids)
+            teacher_logits.extend(outputs.logits.cpu().numpy())  # Convert to NumPy
+
+        # Create a new dataset with teacher logits
+        logits_dataset = Dataset.from_dict({'teacher_logits': teacher_logits})
+        logits_dataset.save_to_disk(config['dataset']['logits_save_path'])
+
+    # Load the dataset with teacher logits
+    logits_dataset = load_dataset(config['dataset']['logits_save_path'])
+
+    # Add teacher logits to the original tokenized dataset
+    tokenized_dataset = tokenized_dataset.add_column(
+        'teacher_logits', logits_dataset['train']['teacher_logits']
+    )
+
+# Split the dataset
+tokenized_dataset = tokenized_dataset.train_test_split(test_size=0.1)
+
 def pad_logits(student_logits, teacher_logits):
     student_size, teacher_size = student_logits.size(-1), teacher_logits.size(-1)
     if student_size != teacher_size:
@@ -138,16 +163,20 @@ def pad_logits(student_logits, teacher_logits):
 class LogitsTrainer(SFTTrainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         inputs = {k: v.to(model.device) if hasattr(v, 'to') else v for k, v in inputs.items()}
-        self.teacher_model = self.teacher_model.to(model.device)
-        
-        student_model = model.module if hasattr(model, 'module') else model
-        teacher_model = self.teacher_model.module if hasattr(self.teacher_model, 'module') else self.teacher_model
 
-        student_outputs = student_model(**inputs)
-        with torch.no_grad():
-            teacher_outputs = teacher_model(**inputs)
+        # If logits are precomputed, retrieve them from inputs
+        if config["distillation"]["precompute_logits"]:
+            teacher_logits = inputs['teacher_logits']
+        else:
+            # Otherwise, compute them on-the-fly
+            with torch.no_grad():
+                self.teacher_model = self.teacher_model.to(model.device)
+                teacher_outputs = self.teacher_model(**inputs)
+                teacher_logits = teacher_outputs.logits
 
-        custom_loss = self.distillation_loss(student_outputs.logits, teacher_outputs.logits, inputs, student_outputs.loss)
+        student_outputs = model(**inputs)
+
+        custom_loss = self.distillation_loss(student_outputs.logits, teacher_logits, inputs, student_outputs.loss)
         return (custom_loss, student_outputs) if return_outputs else custom_loss
 
     def distillation_loss(self, student_logits, teacher_logits, inputs, original_loss):
@@ -177,8 +206,9 @@ trainer = LogitsTrainer(
     max_seq_length=config["tokenizer"]["max_length"],
 )
 
-# Add the teacher model to the trainer
-trainer.teacher_model = teacher_model
+# Add the teacher model to the trainer (only if not precomputing logits)
+if not config["distillation"]["precompute_logits"]:
+    trainer.teacher_model = teacher_model
 
 # Prepare for distributed training
 trainer = accelerator.prepare(trainer)
@@ -188,3 +218,5 @@ trainer.train(resume_from_checkpoint=config["training"]["resume_from_checkpoint"
 
 # Save the final model
 trainer.save_model(config["training"]["output_dir"])
+
+print("Training complete. Model saved to", config["training"]["output_dir"])
