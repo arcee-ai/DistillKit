@@ -13,7 +13,7 @@ config = {
     "dataset": {
         "name": "mlabonne/FineTome-100k",
         "split": "train",
-        # "num_samples": , # You can pass a number here to limit the number of samples to use.
+        "num_samples": 1000, # You can pass a number here to limit the number of samples to use.
         "seed": 42
     },
     "models": {
@@ -32,7 +32,7 @@ config = {
         "save_steps": 1000,
         "logging_steps": 2,
         "save_total_limit": 2,
-        "learning_rate": 2e-4,
+        "learning_rate": 2e-5,
         "weight_decay": 0.01,
         "warmup_ratio": 0.2,
         "lr_scheduler_type": "linear",
@@ -53,11 +53,15 @@ config = {
 
 # Set up environment
 os.environ['WANDB_PROJECT'] = config["project_name"]
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 accelerator = Accelerator()
 device = accelerator.device
 
 # Load and preprocess dataset
 dataset = load_dataset(config["dataset"]["name"], split=config["dataset"]["split"])
+if config["dataset"].get("num_samples"):
+    dataset = dataset.select(range(config["dataset"]["num_samples"]))
 dataset = dataset.shuffle(seed=config["dataset"]["seed"])
 
 # Load tokenizers
@@ -67,27 +71,35 @@ student_tokenizer = AutoTokenizer.from_pretrained(config["models"]["student"])
 # Apply chat template to student tokenizer
 student_tokenizer.chat_template = config["tokenizer"]["chat_template"]
 
-def sharegpt_format(example):
+def prepare_dataset(example):
     system = "You are a helpful assistant chatbot."
     conversations = example['conversations']
     
     message = [{"role": "system", "content": system}]
     
-    if isinstance(conversations, list):
-        for conversation in conversations:
-            if isinstance(conversation, dict):
-                if conversation.get('from') == 'human':
-                    message.append({"role": "user", "content": conversation.get('value', '')})
-                elif conversation.get('from') == 'gpt':
-                    message.append({"role": "assistant", "content": conversation.get('value', '')})
+    for conversation in conversations:
+        if conversation.get('from') == 'human':
+            message.append({"role": "user", "content": conversation.get('value', '')})
+        elif conversation.get('from') == 'gpt':
+            message.append({"role": "assistant", "content": conversation.get('value', '')})
     
-    text = student_tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
-    return {"text": text}
+    student_text = student_tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+    teacher_text = teacher_tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+    
+    student_encodings = student_tokenizer(student_text, truncation=True, max_length=config["tokenizer"]["max_length"], padding='max_length')
+    teacher_encodings = teacher_tokenizer(teacher_text, truncation=True, max_length=config["tokenizer"]["max_length"], padding='max_length')
+
+    return {
+        "input_ids": student_encodings["input_ids"],
+        "attention_mask": student_encodings["attention_mask"],
+        "teacher_input_ids": teacher_encodings["input_ids"],
+        "teacher_attention_mask": teacher_encodings["attention_mask"],
+    }
 
 # Preprocess and tokenize the dataset
 print("Preprocessing and tokenizing dataset...")
 original_columns = dataset.column_names
-dataset = dataset.map(sharegpt_format, remove_columns=original_columns)
+dataset = dataset.map(prepare_dataset, remove_columns=original_columns)
 
 print("Dataset preparation complete. Loading models...")
 
@@ -96,10 +108,9 @@ model_kwargs = {"torch_dtype": torch.bfloat16 if config["training"]["bf16"] else
 if config["model_config"]["use_flash_attention"]:
     model_kwargs["attn_implementation"] = "flash_attention_2"
 
-teacher_model = AutoModelForCausalLM.from_pretrained(config["models"]["teacher"], **model_kwargs)
-student_model = AutoModelForCausalLM.from_pretrained(config["models"]["student"], **model_kwargs)
+teacher_model = AutoModelForCausalLM.from_pretrained(config["models"]["teacher"], **model_kwargs).to(device)
+student_model = AutoModelForCausalLM.from_pretrained(config["models"]["student"], **model_kwargs).to(device)
 
-# Multi-layer Adaptation layer
 class MultiLayerAdaptationLayer(torch.nn.Module):
     def __init__(self, student_dim, teacher_dim, num_student_layers, num_teacher_layers, dtype=torch.bfloat16):
         super().__init__()
@@ -132,25 +143,38 @@ adaptation_layer = MultiLayerAdaptationLayer(
     dtype=torch.bfloat16
 ).to(device)
 
-class HiddenTrainer(SFTTrainer):
+class CustomSFTTrainer(SFTTrainer):
+    def __init__(self, *args, **kwargs):
+        self.remove_unused_columns = kwargs.pop('remove_unused_columns', None)
+        self.max_seq_length = kwargs.get('max_seq_length', 1024)
+        super(CustomSFTTrainer, self).__init__(*args, **kwargs)
+
     def compute_loss(self, model, inputs, return_outputs=False):
-        inputs = {k: v.to(model.device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+        student_inputs = {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+        }
+
+        labels = inputs["labels"]
+
+        student_outputs = model(**student_inputs, labels=labels, output_hidden_states=True)
         
-        self.teacher_model = self.teacher_model.to(model.device)
-        
-        student_model = model.module if hasattr(model, 'module') else model
+        original_loss = student_outputs.loss
+
+        self.teacher_model = self.teacher_model
         teacher_model = self.teacher_model.module if hasattr(self.teacher_model, 'module') else self.teacher_model
 
-        student_outputs = student_model(**inputs, output_hidden_states=True)
-        loss = student_outputs.loss
-        
         with torch.no_grad():
-            teacher_outputs = teacher_model(**inputs, output_hidden_states=True)
-        
-        custom_loss = self.distillation_loss(student_outputs, teacher_outputs, inputs, loss)
-        
-        return (custom_loss, student_outputs) if return_outputs else custom_loss
+            teacher_inputs = {
+                "input_ids": inputs["teacher_input_ids"],
+                "attention_mask": inputs["teacher_attention_mask"],
+            }
+            
+            teacher_outputs = teacher_model(**teacher_inputs, output_hidden_states=True)
 
+        custom_loss = self.distillation_loss(student_outputs, teacher_outputs, inputs, original_loss)
+        return (custom_loss, student_outputs) if return_outputs else custom_loss
+        
     def distillation_loss(self, student_outputs, teacher_outputs, inputs, original_loss):
         student_hidden_states = student_outputs.hidden_states
         teacher_hidden_states = teacher_outputs.hidden_states
@@ -184,22 +208,27 @@ class HiddenTrainer(SFTTrainer):
         return total_loss
 
 # Training arguments
-training_arguments = TrainingArguments(**config["training"])
+# Training arguments
+training_arguments = TrainingArguments(
+    **config["training"],
+    remove_unused_columns=False,
+)
 
 # Create the custom SFT Trainer
-trainer = HiddenTrainer(
+trainer = CustomSFTTrainer(
     model=student_model,
     train_dataset=dataset,
     max_seq_length=config["tokenizer"]["max_length"],
     tokenizer=student_tokenizer,
-    dataset_text_field="text",
     args=training_arguments,
-    packing=True,
+    packing=config["training"].get("packing", False),
 )
 
 # Add these attributes to the trainer
 trainer.teacher_model = teacher_model
 trainer.adaptation_layer = adaptation_layer
+trainer.student_tokenizer = student_tokenizer
+trainer.teacher_tokenizer = teacher_tokenizer
 
 # Prepare for distributed training
 trainer = accelerator.prepare(trainer)
@@ -211,4 +240,4 @@ trainer.train(resume_from_checkpoint=config["training"]["resume_from_checkpoint"
 trainer.save_model(config["training"]["output_dir"])
 
 # Save the adaptation layer
-torch.save(adaptation_layer.state_dict(), "adaptation_layer.pth")
+torch.save(adaptation_layer.state_dict(), os.path.join(config["training"]["output_dir"], "adaptation_layer.pth"))
