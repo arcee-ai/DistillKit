@@ -1,3 +1,6 @@
+import os
+import sys
+
 import click
 import transformers
 
@@ -8,7 +11,6 @@ except ImportError:
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-import pyarrow
 import torch
 import tqdm
 import yaml
@@ -17,6 +19,7 @@ from vllm.logprobs import FlatLogprobs, PromptLogprobs
 from distillkit.compression import DistributionQuantizationConfig, LogprobCompressor
 from distillkit.sample_common import (
     StreamingParquetWriter,
+    compressed_logit_schema,
     load_preprocess_data,
 )
 
@@ -24,7 +27,7 @@ from distillkit.sample_common import (
 @click.command("sample-logits")
 @click.option("--model", type=str, required=True)
 @click.option("--dataset", type=str, required=True)
-@click.option("--configuration", type=str, default=None)
+@click.option("--dataset-configuration", type=str, default=None)
 @click.option("--output", type=str, required=True)
 @click.option("--split", type=str, default="train")
 @click.option("--samples", type=int, default=None)
@@ -45,10 +48,11 @@ from distillkit.sample_common import (
 @click.option("--compression-config", type=str, required=True)
 @click.option("--macrobatch-size", type=int, default=256)
 @click.option("--max-workers", type=int, default=None)
+@click.option("--auto-vocab-size/--no-auto-vocab-size", type=bool, default=True)
 def sample_logits(
     model: str,
     dataset: str,
-    configuration: str | None,
+    dataset_configuration: str | None,
     split: str,
     output: str,
     samples: int | None,
@@ -67,6 +71,7 @@ def sample_logits(
     compression_config: str,
     macrobatch_size: int,
     max_workers: int | None,
+    auto_vocab_size: bool,
 ):
     logging.basicConfig(level=logging.INFO)
 
@@ -79,10 +84,38 @@ def sample_logits(
         cfg = DistributionQuantizationConfig.model_validate(yaml.safe_load(f))
     k = cfg.k
 
+    tok_vocab = tok.get_vocab()
+    tok_vocab_size = max(len(tok_vocab), max(tok_vocab.values()))
+    if cfg.d != tok_vocab_size:
+        if auto_vocab_size:
+            cfg.d = tok_vocab_size
+            logging.warning(
+                f"Automatically set compressor vocab size to {tok_vocab_size}"
+            )
+        elif cfg.d < tok_vocab_size:
+            logging.error("Compression config has too small vocabulary size!")
+            logging.error(
+                f"cfg.d: {cfg.d}, effective tokenizer vocab size: {tok_vocab_size}"
+            )
+            sys.exit(-1)
+        elif (
+            abs(cfg.d - tok_vocab_size) > 32
+        ):  # allow a little wiggle room for common padding
+            logging.warning(
+                f"Vocabulary size in compression config ({cfg.d}) is larger than needed ({tok_vocab_size}). "
+                "This will work but may consume more space than needed - double check that this is what you want."
+            )
+
+    os.makedirs(output, exist_ok=True)
+    with open(
+        os.path.join(output, "compression_config.yaml"), "w", encoding="utf-8"
+    ) as f:
+        yaml.safe_dump(cfg.model_dump(mode="json"), f)
+
     logging.info(f"Loading and preprocessing data from {dataset} ({split})")
     ds = load_preprocess_data(
         dataset=dataset,
-        configuration=configuration,
+        configuration=dataset_configuration,
         split=split,
         samples=samples,
         seed=seed,
@@ -128,17 +161,6 @@ def sample_logits(
     )
 
     logging.info(f"Generating logits for {len(ds)} samples")
-    schema = pyarrow.schema(
-        [
-            pyarrow.field("input_ids", pyarrow.list_(pyarrow.uint64())),
-            pyarrow.field(
-                "compressed_logprobs", pyarrow.list_(pyarrow.list_(pyarrow.uint8()))
-            ),
-            pyarrow.field(
-                "bytepacked_indices", pyarrow.list_(pyarrow.list_(pyarrow.uint8()))
-            ),
-        ]
-    )
 
     def process_and_write_sample(
         req_out: vllm.RequestOutput,
@@ -175,7 +197,7 @@ def sample_logits(
     try:
         with StreamingParquetWriter(
             output,
-            schema=schema,
+            schema=compressed_logit_schema(),
             file_max_rows=macrobatch_size,
             queue_maxsize=macrobatch_size * 2,
         ) as writer:
@@ -203,7 +225,7 @@ def sample_logits(
                         )
                         futures.append(future)
 
-                    # Limit queue size to avoid unbounded memory growth
+                    # Limit writes in flight to avoid unbounded memory growth
                     while len(futures) > macrobatch_size * 2:
                         futures.pop(0).result()
 

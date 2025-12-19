@@ -300,19 +300,19 @@ class StreamingParquetWriter:
         return False
 
 
-# def compressed_logit_schema() -> pyarrow.Schema:
-#     return pyarrow.schema(
-#         [
-#             pyarrow.field("input_ids", pyarrow.list_(pyarrow.uint64())),
-#             pyarrow.field(
-#                 "packed_indices", pyarrow.list_(pyarrow.list_(pyarrow.uint64()))
-#             ),
-#             pyarrow.field(
-#                 "exact_values", pyarrow.list_(pyarrow.list_(pyarrow.float32()))
-#             ),
-#             pyarrow.field("coeffs", pyarrow.list_(pyarrow.list_(pyarrow.float32()))),
-#         ]
-#     )
+def legacy_compressed_logit_schema() -> pyarrow.Schema:
+    return pyarrow.schema(
+        [
+            pyarrow.field("input_ids", pyarrow.list_(pyarrow.uint64())),
+            pyarrow.field(
+                "packed_indices", pyarrow.list_(pyarrow.list_(pyarrow.uint64()))
+            ),
+            pyarrow.field(
+                "exact_values", pyarrow.list_(pyarrow.list_(pyarrow.float32()))
+            ),
+            pyarrow.field("coeffs", pyarrow.list_(pyarrow.list_(pyarrow.float32()))),
+        ]
+    )
 
 
 def compressed_logit_schema() -> pyarrow.Schema:
