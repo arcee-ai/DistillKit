@@ -1,6 +1,4 @@
-from typing import Tuple
 import click
-import numpy as np
 import transformers
 
 try:
@@ -9,7 +7,6 @@ except ImportError:
     raise ImportError("VLLM must be installed to use this script.")
 import logging
 from concurrent.futures import ThreadPoolExecutor
-import queue
 
 import pyarrow
 import torch
@@ -22,7 +19,7 @@ from distillkit.sample_common import (
     load_preprocess_data,
 )
 
-from vllm.logprobs import PromptLogprobs, FlatLogprobs, Logprob, LogprobsOnePosition
+from vllm.logprobs import PromptLogprobs, FlatLogprobs
 
 
 @click.command("sample-logits")
@@ -93,7 +90,7 @@ def sample_logits(
         split=split,
         samples=samples,
         seed=seed,
-        max_seq_len=max_seq_len + 1,
+        max_seq_len=max_seq_len,
         tokenizer=tok,
         add_extra_pad_token=True,
         apply_chat_template=apply_chat_template,
@@ -148,9 +145,7 @@ def sample_logits(
         ]
     )
 
-    def process_and_write_sample(
-        req_out, input_ids_sample, max_seq_len, k, compressor, writer
-    ):
+    def process_and_write_sample(req_out, input_ids_sample, k, compressor, writer):
         """Process a single sample: extract logprobs, compress, and write to disk."""
         top_indices, top_values = process_prompt_logprobs(req_out.prompt_logprobs, k=k)
         top_indices.unsqueeze_(0)
@@ -161,13 +156,16 @@ def sample_logits(
             top_values,
         )
 
-        input_ids_list = input_ids_sample[:max_seq_len]
-        compressed_logprobs_list = row_out["compressed_logprobs"].squeeze(0).tolist()
-        bytepacked_indices_list = row_out["bytepacked_indices"].squeeze(0).tolist()
+        compressed_logprobs_list = (
+            row_out["compressed_logprobs"].cpu().squeeze(0).tolist()
+        )
+        bytepacked_indices_list = (
+            row_out["bytepacked_indices"].cpu().squeeze(0).tolist()
+        )
 
         writer.write(
             {
-                "input_ids": input_ids_list,
+                "input_ids": input_ids_sample,
                 "compressed_logprobs": compressed_logprobs_list,
                 "bytepacked_indices": bytepacked_indices_list,
             }
@@ -179,22 +177,16 @@ def sample_logits(
         file_max_rows=macrobatch_size,
         queue_maxsize=macrobatch_size * 2,
     ) as writer:
-        # Use ThreadPoolExecutor to pipeline CPU processing with GPU inference
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
 
             for i0 in tqdm.tqdm(
                 range(0, len(ds), macrobatch_size), desc="Logit Batches"
             ):
-                input_ids = ds.select(range(i0, min(i0 + macrobatch_size, len(ds))))[
-                    "input_ids"
-                ]
-                input_ids = [x[:max_seq_len] for x in input_ids]
-
-                # GPU inference (blocking)
+                batch_input_ids = ds[i0 : i0 + macrobatch_size]["input_ids"]
                 outputs = list(
                     llm.generate(
-                        [{"prompt_token_ids": x} for x in input_ids],
+                        [{"prompt_token_ids": x} for x in batch_input_ids],
                         sampling_params=sampling_params,
                     )
                 )
@@ -204,8 +196,7 @@ def sample_logits(
                     future = executor.submit(
                         process_and_write_sample,
                         req_out,
-                        input_ids[idx],
-                        max_seq_len,
+                        batch_input_ids[idx],
                         k,
                         compressor,
                         writer,
@@ -213,11 +204,9 @@ def sample_logits(
                     futures.append(future)
 
                 # Limit queue size to avoid unbounded memory growth
-                # Wait for older batches if we have too many pending
                 while len(futures) > macrobatch_size * 2:
                     futures.pop(0).result()
 
-            # Wait for all remaining tasks to complete
             for future in futures:
                 future.result()
 
