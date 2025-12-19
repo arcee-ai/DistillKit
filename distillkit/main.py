@@ -23,10 +23,16 @@ from distillkit.configuration import (
     LocalDataset,
     TeacherDatasetConfig,
     TeacherModelConfig,
+    TeacherVLLMConfig,
 )
 from distillkit.hsd_mapping import HiddenStateMapping
 from distillkit.monkey_patch_packing import monkey_patch_packing_for_model
-from distillkit.signals import OfflineSignalSource, OnlineSignalSource, SignalSource
+from distillkit.signals import (
+    OfflineSignalSource,
+    OnlineSignalSource,
+    SignalSource,
+    VLLMSignalSource,
+)
 from distillkit.trainer import DistillationTrainer
 
 LOG = logging.getLogger(__name__)
@@ -264,6 +270,16 @@ def create_signal_source(
         )
         return OnlineSignalSource(
             teacher_model, vocab_size=vocab_size, sparsify_top_k=config.teacher.top_k
+        )
+    elif isinstance(config.teacher, TeacherVLLMConfig):
+        return VLLMSignalSource(
+            base_url=config.teacher.base_url,
+            model=config.teacher.model,
+            top_k=config.teacher.top_k,
+            vocab_size=vocab_size,
+            api_key=config.teacher.api_key,
+            timeout=config.teacher.timeout,
+            max_retries=config.teacher.max_retries,
         )
     else:
         raise RuntimeError("Teacher configuration invalid")

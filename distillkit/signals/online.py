@@ -1,86 +1,18 @@
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, TypeAlias
+# Copyright 2025 Arcee AI
+"""Online signal source using HuggingFace model inference."""
+
+from typing import Any
 
 import torch
 import transformers
 from typing_extensions import override
 
-from distillkit.compression import LogprobCompressor
-
-
-@dataclass
-class TeacherSignalBase:
-    generation_temperature: float
-    hidden_states: tuple[torch.Tensor, ...] | None
-    vocab_size: int
-
-
-@dataclass
-class DenseSignal(TeacherSignalBase):
-    logits: torch.Tensor
-
-
-@dataclass
-class SparseSignal(TeacherSignalBase):
-    sparse_ids: torch.LongTensor
-    sparse_values: torch.Tensor
-    log_values: bool  # if True, values are logprobs
-
-
-TeacherSignal: TypeAlias = SparseSignal | DenseSignal
-
-
-class SignalSource(ABC):
-    @abstractmethod
-    def supports_hidden_states(self) -> bool: ...
-
-    @abstractmethod
-    def get_signal(
-        self, batch: dict[str, Any], return_hidden_states: bool = False
-    ) -> TeacherSignal: ...
-
-
-class OfflineSignalSource(SignalSource):
-    compressor: LogprobCompressor
-    preapplied_temperature: float
-    vocab_size: int
-    log_values: bool
-
-    def __init__(
-        self,
-        compressor: LogprobCompressor,
-        vocab_size: int,
-        preapplied_temperature: float = 1.0,
-        log_values: bool = True,
-    ):
-        self.compressor = compressor
-        self.vocab_size = vocab_size
-        self.preapplied_temperature = preapplied_temperature
-        self.log_values = log_values
-
-    @override
-    def supports_hidden_states(self) -> bool:
-        return False
-
-    @override
-    def get_signal(
-        self, batch: dict[str, Any], return_hidden_states: bool = False
-    ) -> SparseSignal:
-        if return_hidden_states:
-            raise RuntimeError(
-                "Hidden states requested but signal source is precomputed logits"
-            )
-        with torch.no_grad():
-            sparse_ids, sparse_values = self.compressor.decompress_to_sparse(batch)
-        return SparseSignal(
-            sparse_ids=sparse_ids,
-            sparse_values=sparse_values,
-            log_values=self.log_values,
-            generation_temperature=self.preapplied_temperature,
-            hidden_states=None,
-            vocab_size=self.vocab_size,
-        )
+from distillkit.signals.base import (
+    DenseSignal,
+    SignalSource,
+    SparseSignal,
+    TeacherSignal,
+)
 
 
 class OnlineSignalSource(SignalSource):

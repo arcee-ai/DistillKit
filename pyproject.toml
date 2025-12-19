@@ -21,6 +21,7 @@ dependencies = [
     "torch>=2.0.0",
     "wandb",
     "tqdm",
+    "aiohttp>=3.9.0",
 ]
 
 
@@ -38,4 +39,4 @@ capture = [
 repository = "https://github.com/arcee-ai/distillkit"
 
 [tool.setuptools]
-packages = ["distillkit", "distillkit.compression", "distillkit.lossfuncs"]
+packages = ["distillkit", "distillkit.compression", "distillkit.lossfuncs", "distillkit.signals"]

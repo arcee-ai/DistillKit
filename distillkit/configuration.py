@@ -140,6 +140,31 @@ class TeacherDatasetConfig(BaseModel):
     )
 
 
+class TeacherVLLMConfig(BaseModel):
+    kind: Literal["vllm"] = "vllm"
+    base_url: str = Field(
+        description="Base URL of the vLLM server (e.g., 'http://localhost:8000')",
+    )
+    api_key: str | None = Field(
+        default=None,
+        description="API key for authentication (if required)",
+    )
+    model: str = Field(
+        description="Model ID to request from the vLLM server.",
+    )
+    top_k: int = Field(
+        description="Number of top-k logprobs to request from vLLM",
+    )
+    timeout: float = Field(
+        default=120.0,
+        description="Request timeout in seconds",
+    )
+    max_retries: int = Field(
+        default=3,
+        description="Maximum number of retries for failed requests",
+    )
+
+
 class DistillationRunConfig(BaseModel):
     project_name: str = Field(
         default="distillkit",
@@ -150,7 +175,7 @@ class DistillationRunConfig(BaseModel):
         alias="model",
     )
     dataset: DatasetConfiguration
-    teacher: TeacherModelConfig | TeacherDatasetConfig = Field(
+    teacher: TeacherModelConfig | TeacherDatasetConfig | TeacherVLLMConfig = Field(
         ..., discriminator="kind"
     )
     sequence_length: int = Field(
