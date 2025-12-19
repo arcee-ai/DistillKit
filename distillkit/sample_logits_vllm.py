@@ -76,8 +76,7 @@ def sample_logits(
 
     # load compression config
     with open(compression_config, "r") as f:
-        compression_config_text = yaml.safe_load(f)
-    cfg = DistributionQuantizationConfig.model_validate(compression_config_text)
+        cfg = DistributionQuantizationConfig.model_validate(yaml.safe_load(f))
     k = cfg.k
 
     logging.info(f"Loading and preprocessing data from {dataset} ({split})")
@@ -123,7 +122,7 @@ def sample_logits(
         prompt_logprobs=k,
         logprobs=k,
         flat_logprobs=True,
-        max_tokens=1,  # we don't actually want any generated tokens but 1 is minimum
+        max_tokens=1,  # vLLM wants at least 1 generated token
         detokenize=False,
         skip_special_tokens=False,
     )
@@ -141,7 +140,13 @@ def sample_logits(
         ]
     )
 
-    def process_and_write_sample(req_out, input_ids_sample, k, compressor, writer):
+    def process_and_write_sample(
+        req_out: vllm.RequestOutput,
+        input_ids_sample: list[int],
+        k: int,
+        compressor: LogprobCompressor,
+        writer: StreamingParquetWriter,
+    ) -> None:
         """Process a single sample: extract logprobs, compress, and write to disk."""
         top_indices, top_values = process_prompt_logprobs(req_out.prompt_logprobs, k=k)
         top_indices.unsqueeze_(0)
@@ -167,47 +172,47 @@ def sample_logits(
             }
         )
 
-    with StreamingParquetWriter(
-        output,
-        schema=schema,
-        file_max_rows=macrobatch_size,
-        queue_maxsize=macrobatch_size * 2,
-    ) as writer:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
+    try:
+        with StreamingParquetWriter(
+            output,
+            schema=schema,
+            file_max_rows=macrobatch_size,
+            queue_maxsize=macrobatch_size * 2,
+        ) as writer:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
 
-            for i0 in tqdm.tqdm(
-                range(0, len(ds), macrobatch_size), desc="Logit Batches"
-            ):
-                batch_input_ids = ds[i0 : i0 + macrobatch_size]["input_ids"]
-                outputs = list(
-                    llm.generate(
-                        [{"prompt_token_ids": x} for x in batch_input_ids],
-                        sampling_params=sampling_params,
-                    )
-                )
+                for i0 in tqdm.tqdm(
+                    range(0, len(ds), macrobatch_size), desc="Logit Batches"
+                ):
+                    batch_input_ids = ds[i0 : i0 + macrobatch_size]["input_ids"]
+                    # Submit CPU processing tasks to background thread
+                    for idx, req_out in enumerate(
+                        llm.generate(
+                            [{"prompt_token_ids": x} for x in batch_input_ids],
+                            sampling_params=sampling_params,
+                        )
+                    ):
+                        future = executor.submit(
+                            process_and_write_sample,
+                            req_out,
+                            batch_input_ids[idx],
+                            k,
+                            compressor,
+                            writer,
+                        )
+                        futures.append(future)
 
-                # Submit CPU processing tasks to background thread
-                for idx, req_out in enumerate(outputs):
-                    future = executor.submit(
-                        process_and_write_sample,
-                        req_out,
-                        batch_input_ids[idx],
-                        k,
-                        compressor,
-                        writer,
-                    )
-                    futures.append(future)
+                    # Limit queue size to avoid unbounded memory growth
+                    while len(futures) > macrobatch_size * 2:
+                        futures.pop(0).result()
 
-                # Limit queue size to avoid unbounded memory growth
-                while len(futures) > macrobatch_size * 2:
-                    futures.pop(0).result()
+                for future in futures:
+                    future.result()
 
-            for future in futures:
-                future.result()
-
-    logging.info(f"Logits saved to {output}")
-    del llm
+        logging.info(f"Logits saved to {output}")
+    finally:
+        del llm
 
 
 def process_prompt_logprobs(
@@ -253,6 +258,8 @@ def process_prompt_logprobs(
             for i in range(start_idx, end_idx):
                 rank = prompt_logprobs.ranks[i]
                 if rank is None or rank > k:
+                    # None: vLLM returns the actual prompt token even when not in top-k
+                    # rank > k: Truncate to only the k values we requested
                     continue
                 seq_ids.append(seq_id)
                 rank_ids.append(rank - 1)
@@ -290,7 +297,9 @@ def process_prompt_logprobs(
             (num_prompt_tokens, k), fill_value=float("-inf"), dtype=torch.float32
         )
         for seq_id, logprobs in enumerate(valid_logprobs):
-            assert logprobs is not None, "Missing logprobs for non-first token"
+            assert logprobs is not None, (
+                f"Missing logprobs for token at position {seq_id + 1} (expected logprobs for all non-first tokens)"
+            )
             for tok_id, logprob in logprobs.items():
                 if logprob.rank is None or logprob.rank > k:
                     continue
