@@ -12,14 +12,13 @@ import pyarrow
 import torch
 import tqdm
 import yaml
+from vllm.logprobs import FlatLogprobs, PromptLogprobs
 
 from distillkit.compression import DistributionQuantizationConfig, LogprobCompressor
 from distillkit.sample_common import (
     StreamingParquetWriter,
     load_preprocess_data,
 )
-
-from vllm.logprobs import PromptLogprobs, FlatLogprobs
 
 
 @click.command("sample-logits")
