@@ -1,3 +1,4 @@
+from typing import Tuple
 import click
 import numpy as np
 import transformers
@@ -18,6 +19,8 @@ from distillkit.sample_common import (
     StreamingParquetWriter,
     load_preprocess_data,
 )
+
+from vllm.logprobs import PromptLogprobs, FlatLogprobs, Logprob, LogprobsOnePosition
 
 
 @click.command("sample-logits")
@@ -40,13 +43,6 @@ from distillkit.sample_common import (
 @click.option("--gpu-memory-utilization", type=float, default=0.9)
 @click.option("--compression-config", type=str, required=True)
 @click.option("--macrobatch-size", type=int, default=256)
-@click.option(
-    "--multinomial/--no-multinomial",
-    "logprob_multinomial_sampling",
-    type=bool,
-    default=False,
-    help="Use multinomial sampling for logprobs.",
-)
 def sample_logits(
     model: str,
     dataset: str,
@@ -67,7 +63,6 @@ def sample_logits(
     gpu_memory_utilization: float,
     compression_config: str,
     macrobatch_size: int,
-    logprob_multinomial_sampling: bool,
 ):
     logging.basicConfig(level=logging.INFO)
 
@@ -106,7 +101,7 @@ def sample_logits(
         pipeline_parallel_size=pipeline_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
         max_logprobs=k,
-        enable_chunked_prefill=False,
+        logprobs_mode="raw_logprobs",
         max_model_len=max_model_len,
         distributed_executor_backend="ray",
     )
@@ -124,9 +119,11 @@ def sample_logits(
         presence_penalty=0,
         repetition_penalty=1,
         prompt_logprobs=k,
+        logprobs=k,
+        flat_logprobs=True,
         max_tokens=1,
         detokenize=False,
-        logprob_multinomial_sampling=logprob_multinomial_sampling,
+        skip_special_tokens=False,
     )
 
     logging.info(f"Generating logits for {len(ds)} samples")
@@ -154,25 +151,15 @@ def sample_logits(
             input_ids = [x[:max_seq_len] for x in input_ids]
             for idx, req_out in enumerate(
                 llm.generate(
-                    prompt_token_ids=input_ids, sampling_params=sampling_params
+                    [{"prompt_token_ids": x} for x in input_ids],
+                    sampling_params=sampling_params,
                 )
             ):
-                prompt_logprobs = req_out.prompt_logprobs
-                if prompt_logprobs and prompt_logprobs[0] is None:
-                    prompt_logprobs = prompt_logprobs[1:]
                 top_indices, top_values = process_prompt_logprobs(
-                    prompt_logprobs, k=k + 1
+                    req_out.prompt_logprobs, k=k + 1
                 )
                 top_indices.unsqueeze_(0)
                 top_values.unsqueeze_(0)
-
-                if logprob_multinomial_sampling:
-                    # top_indices is not unique in this case
-                    # assign 1/N probability to each index
-                    # sum over duplicates
-                    raise NotImplementedError(
-                        "Multinomial sampling not yet implemented"
-                    )
 
                 row_out = compressor.compress_from_sparse(
                     # skip first token, which is always the prompt token
@@ -200,7 +187,9 @@ def sample_logits(
     del llm
 
 
-def process_prompt_logprobs(prompt_logprobs, k: int):
+def process_prompt_logprobs(
+    prompt_logprobs: PromptLogprobs, k: int
+) -> tuple[torch.LongTensor, torch.Tensor]:
     valid_logprobs = [lp for lp in prompt_logprobs if lp is not None]
 
     if not valid_logprobs:
@@ -219,9 +208,10 @@ def process_prompt_logprobs(prompt_logprobs, k: int):
 
     current_idx = 0
     for logprobs_at_token in valid_logprobs:  # list[tuple[int, float]]
-        for i in range(k):
-            np_indices[current_idx] = logprobs_at_token[i][0]
-            np_values[current_idx] = logprobs_at_token[i][1]
+        assert len(logprobs_at_token) >= k
+        for token_id, logprob in logprobs_at_token.items():
+            np_indices[current_idx] = token_id
+            np_values[current_idx] = logprob.logprob
             current_idx += 1
 
     top_indices = (

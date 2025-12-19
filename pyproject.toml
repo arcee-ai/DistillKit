@@ -30,7 +30,7 @@ distillkit = "distillkit.main:main"
 [project.optional-dependencies]
 dev = ["pytest~=9.0.2", "ruff~=0.14.9"]
 capture = [
-    "vllm @ git+https://github.com/cg123/vllm.git@multinomial2",
+    "vllm>=0.12.0",
     "pyarrow",
 ]
 
