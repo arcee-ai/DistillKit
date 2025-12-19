@@ -42,8 +42,6 @@ To capture your own teacher outputs, install the capture dependencies:
 pip install -e ".[capture]"
 ```
 
-This includes our [vLLM fork](https://github.com/cg123/vllm/tree/multinomial2) modified for high-throughput logit sampling. Note: This fork is pretty long in the tooth and uses the older V0 vLLM engine. We plan to add HuggingFace-based capture in the future for broader model compatibility.
-
 For most users, we recommend starting with the pre-captured teacher datasets we provide (see [Datasets](#datasets) below).
 
 ## Quick Start
@@ -321,7 +319,7 @@ python -m distillkit.sample_logits_vllm \
   --compression-config ./compression_config.yaml
 ```
 
-Requires our vLLM fork (see [Installation](#optional-logit-capture)). This is a little gnarly at the moment. Sorry. 
+Requires vLLM (see [Installation](#optional-logit-capture)).
 
 ### Memory Management Tips
 
