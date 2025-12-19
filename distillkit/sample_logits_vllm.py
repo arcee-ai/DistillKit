@@ -85,7 +85,7 @@ def sample_logits(
     k = cfg.k
 
     tok_vocab = tok.get_vocab()
-    tok_vocab_size = max(len(tok_vocab), max(tok_vocab.values()))
+    tok_vocab_size = max(len(tok_vocab) + 1, max(tok_vocab.values()))
     if cfg.d != tok_vocab_size:
         if auto_vocab_size:
             cfg.d = tok_vocab_size
