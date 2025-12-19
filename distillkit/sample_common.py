@@ -23,7 +23,7 @@ ROLE_MAP = {
 def maybe_trim_bos(text: str, tokenizer: transformers.PreTrainedTokenizerBase):
     if (
         tokenizer.bos_token_id is not None
-        and tokenizer.add_bos_token
+        and getattr(tokenizer, "add_bos_token", False)
         and text.startswith(tokenizer.bos_token)
     ):
         return text[len(tokenizer.bos_token) :]

@@ -8,6 +8,8 @@ try:
 except ImportError:
     raise ImportError("VLLM must be installed to use this script.")
 import logging
+from concurrent.futures import ThreadPoolExecutor
+import queue
 
 import pyarrow
 import torch
@@ -37,12 +39,16 @@ from vllm.logprobs import PromptLogprobs, FlatLogprobs, Logprob, LogprobsOnePosi
 @click.option("--max-model-len", type=int, default=None)
 @click.option("--tensor-parallel-size", type=int, default=1)
 @click.option("--pipeline-parallel-size", type=int, default=1)
+@click.option(
+    "--enable-expert-parallel/--no-enable-expert-parallel", type=bool, default=False
+)
 @click.option("--dtype", type=str, default=None)
 @click.option("--quantization", type=str, default=None)
 @click.option("--trust-remote-code/--no-trust-remote-code", default=False)
 @click.option("--gpu-memory-utilization", type=float, default=0.9)
 @click.option("--compression-config", type=str, required=True)
 @click.option("--macrobatch-size", type=int, default=256)
+@click.option("--max-workers", type=int, default=None)
 def sample_logits(
     model: str,
     dataset: str,
@@ -57,12 +63,14 @@ def sample_logits(
     max_model_len: int | None,
     tensor_parallel_size: int,
     pipeline_parallel_size: int,
+    enable_expert_parallel: bool,
     dtype: str | None,
     quantization: str | None,
     trust_remote_code: bool,
     gpu_memory_utilization: float,
     compression_config: str,
     macrobatch_size: int,
+    max_workers: int | None,
 ):
     logging.basicConfig(level=logging.INFO)
 
@@ -99,6 +107,7 @@ def sample_logits(
         trust_remote_code=trust_remote_code,
         tensor_parallel_size=tensor_parallel_size,
         pipeline_parallel_size=pipeline_parallel_size,
+        enable_expert_parallel=enable_expert_parallel,
         gpu_memory_utilization=gpu_memory_utilization,
         max_logprobs=k,
         logprobs_mode="raw_logprobs",
@@ -138,50 +147,79 @@ def sample_logits(
             ),
         ]
     )
+
+    def process_and_write_sample(
+        req_out, input_ids_sample, max_seq_len, k, compressor, writer
+    ):
+        """Process a single sample: extract logprobs, compress, and write to disk."""
+        top_indices, top_values = process_prompt_logprobs(req_out.prompt_logprobs, k=k)
+        top_indices.unsqueeze_(0)
+        top_values.unsqueeze_(0)
+
+        row_out = compressor.compress_from_sparse(
+            top_indices,
+            top_values,
+        )
+
+        input_ids_list = input_ids_sample[:max_seq_len]
+        compressed_logprobs_list = row_out["compressed_logprobs"].squeeze(0).tolist()
+        bytepacked_indices_list = row_out["bytepacked_indices"].squeeze(0).tolist()
+
+        writer.write(
+            {
+                "input_ids": input_ids_list,
+                "compressed_logprobs": compressed_logprobs_list,
+                "bytepacked_indices": bytepacked_indices_list,
+            }
+        )
+
     with StreamingParquetWriter(
         output,
         schema=schema,
         file_max_rows=macrobatch_size,
         queue_maxsize=macrobatch_size * 2,
     ) as writer:
-        for i0 in tqdm.tqdm(range(0, len(ds), macrobatch_size), desc="Logit Batches"):
-            input_ids = ds.select(range(i0, min(i0 + macrobatch_size, len(ds))))[
-                "input_ids"
-            ]
-            input_ids = [x[:max_seq_len] for x in input_ids]
-            for idx, req_out in enumerate(
-                llm.generate(
-                    [{"prompt_token_ids": x} for x in input_ids],
-                    sampling_params=sampling_params,
-                )
+        # Use ThreadPoolExecutor to pipeline CPU processing with GPU inference
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+
+            for i0 in tqdm.tqdm(
+                range(0, len(ds), macrobatch_size), desc="Logit Batches"
             ):
-                top_indices, top_values = process_prompt_logprobs(
-                    req_out.prompt_logprobs, k=k + 1
-                )
-                top_indices.unsqueeze_(0)
-                top_values.unsqueeze_(0)
+                input_ids = ds.select(range(i0, min(i0 + macrobatch_size, len(ds))))[
+                    "input_ids"
+                ]
+                input_ids = [x[:max_seq_len] for x in input_ids]
 
-                row_out = compressor.compress_from_sparse(
-                    # skip first token, which is always the prompt token
-                    top_indices[..., 1 : k + 1],
-                    top_values[..., 1 : k + 1],
-                )
-
-                input_ids_list = input_ids[idx][:max_seq_len]
-                compressed_logprobs_list = (
-                    row_out["compressed_logprobs"].squeeze(0).tolist()
-                )
-                bytepacked_indices_list = (
-                    row_out["bytepacked_indices"].squeeze(0).tolist()
+                # GPU inference (blocking)
+                outputs = list(
+                    llm.generate(
+                        [{"prompt_token_ids": x} for x in input_ids],
+                        sampling_params=sampling_params,
+                    )
                 )
 
-                writer.write(
-                    {
-                        "input_ids": input_ids_list,
-                        "compressed_logprobs": compressed_logprobs_list,
-                        "bytepacked_indices": bytepacked_indices_list,
-                    }
-                )
+                # Submit CPU processing tasks to background thread
+                for idx, req_out in enumerate(outputs):
+                    future = executor.submit(
+                        process_and_write_sample,
+                        req_out,
+                        input_ids[idx],
+                        max_seq_len,
+                        k,
+                        compressor,
+                        writer,
+                    )
+                    futures.append(future)
+
+                # Limit queue size to avoid unbounded memory growth
+                # Wait for older batches if we have too many pending
+                while len(futures) > macrobatch_size * 2:
+                    futures.pop(0).result()
+
+            # Wait for all remaining tasks to complete
+            for future in futures:
+                future.result()
 
     logging.info(f"Logits saved to {output}")
     del llm
@@ -190,42 +228,92 @@ def sample_logits(
 def process_prompt_logprobs(
     prompt_logprobs: PromptLogprobs, k: int
 ) -> tuple[torch.LongTensor, torch.Tensor]:
-    valid_logprobs = [lp for lp in prompt_logprobs if lp is not None]
+    # Fast path: directly access FlatLogprobs data without materializing dicts
+    if isinstance(prompt_logprobs, FlatLogprobs):
+        # Skip first position if it's empty (first token has no logprobs)
+        start_pos = 0
+        if len(prompt_logprobs) > 0:
+            first_start = prompt_logprobs.start_indices[0]
+            first_end = prompt_logprobs.end_indices[0]
+            if first_end - first_start == 0:
+                start_pos = 1
 
-    if not valid_logprobs:
-        return torch.empty((0, 0), dtype=torch.long, device="cuda"), torch.empty(
-            (0, 0), dtype=torch.float32, device="cuda"
+        num_prompt_tokens = len(prompt_logprobs) - start_pos
+        if num_prompt_tokens <= 0:
+            return torch.empty((0, 0), dtype=torch.long), torch.empty(
+                (0, 0), dtype=torch.float32
+            )
+
+        # Pre-allocate on CUDA directly and use vectorized operations
+        top_indices = torch.empty(
+            (num_prompt_tokens, k), dtype=torch.long, device="cpu"
+        )
+        top_values = torch.full(
+            (num_prompt_tokens, k),
+            fill_value=float("-inf"),
+            dtype=torch.float32,
+            device="cpu",
         )
 
-    num_prompt_tokens = len(valid_logprobs)
-    total_elements = num_prompt_tokens * k
-    if total_elements == 0:
-        return torch.empty((0, k), dtype=torch.long, device="cuda"), torch.empty(
-            (0, k), dtype=torch.float32, device="cuda"
+        # Build index arrays for vectorized assignment
+        seq_ids = []
+        rank_ids = []
+        token_ids_to_copy = []
+        logprobs_to_copy = []
+
+        for pos_id in range(start_pos, len(prompt_logprobs)):
+            seq_id = pos_id - start_pos
+            start_idx = prompt_logprobs.start_indices[pos_id]
+            end_idx = prompt_logprobs.end_indices[pos_id]
+
+            for i in range(start_idx, end_idx):
+                rank = prompt_logprobs.ranks[i]
+                if rank is None or rank > k:
+                    continue
+                seq_ids.append(seq_id)
+                rank_ids.append(rank - 1)
+                token_ids_to_copy.append(prompt_logprobs.token_ids[i])
+                logprobs_to_copy.append(prompt_logprobs.logprobs[i])
+
+        # Vectorized assignment using advanced indexing
+        if seq_ids:
+            seq_idx_tensor = torch.tensor(seq_ids, dtype=torch.long)
+            rank_idx_tensor = torch.tensor(rank_ids, dtype=torch.long)
+            top_indices[seq_idx_tensor, rank_idx_tensor] = torch.tensor(
+                token_ids_to_copy, dtype=top_indices.dtype, device=top_indices.device
+            )
+            top_values[seq_idx_tensor, rank_idx_tensor] = torch.tensor(
+                logprobs_to_copy, dtype=top_values.dtype, device=top_values.device
+            )
+
+        return top_indices, top_values
+
+    # Slow path: handle legacy list format
+    else:
+        valid_logprobs = [lp for lp in prompt_logprobs]
+        if valid_logprobs[0] is None or len(valid_logprobs[0]) < 1:
+            valid_logprobs.pop(0)
+
+        if not valid_logprobs:
+            return torch.empty((0, 0), dtype=torch.long), torch.empty(
+                (0, 0), dtype=torch.float32
+            )
+
+        num_prompt_tokens = len(valid_logprobs)
+
+        top_indices = torch.empty((num_prompt_tokens, k), dtype=torch.long)
+        top_values = torch.full(
+            (num_prompt_tokens, k), fill_value=float("-inf"), dtype=torch.float32
         )
-    np_indices = np.empty(total_elements, dtype=np.int64)
-    np_values = np.empty(total_elements, dtype=np.float32)
+        for seq_id, logprobs in enumerate(valid_logprobs):
+            assert logprobs is not None, "Missing logprobs for non-first token"
+            for tok_id, logprob in logprobs.items():
+                if logprob.rank is None or logprob.rank > k:
+                    continue
+                top_indices[seq_id, logprob.rank - 1] = tok_id
+                top_values[seq_id, logprob.rank - 1] = logprob.logprob
 
-    current_idx = 0
-    for logprobs_at_token in valid_logprobs:  # list[tuple[int, float]]
-        assert len(logprobs_at_token) >= k
-        for token_id, logprob in logprobs_at_token.items():
-            np_indices[current_idx] = token_id
-            np_values[current_idx] = logprob.logprob
-            current_idx += 1
-
-    top_indices = (
-        torch.from_numpy(np_indices)
-        .view(num_prompt_tokens, k)
-        .to(device="cuda", non_blocking=True)
-    )
-    top_values = (
-        torch.from_numpy(np_values)
-        .view(num_prompt_tokens, k)
-        .to(device="cuda", non_blocking=True)
-    )
-
-    return top_indices, top_values
+        return top_indices, top_values
 
 
 if __name__ == "__main__":
