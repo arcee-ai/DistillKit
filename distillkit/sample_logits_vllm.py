@@ -76,11 +76,9 @@ def sample_logits(
 
     # load compression config
     with open(compression_config, "r") as f:
-        compression_config = yaml.safe_load(f)
-    compression_config = DistributionQuantizationConfig.model_validate(
-        compression_config
-    )
-    k = compression_config.k
+        compression_config_text = yaml.safe_load(f)
+    cfg = DistributionQuantizationConfig.model_validate(compression_config_text)
+    k = cfg.k
 
     logging.info(f"Loading and preprocessing data from {dataset} ({split})")
     ds = load_preprocess_data(
@@ -108,11 +106,10 @@ def sample_logits(
         max_logprobs=k,
         logprobs_mode="raw_logprobs",
         max_model_len=max_model_len,
-        distributed_executor_backend="ray",
     )
 
     compressor = LogprobCompressor(
-        config=compression_config,
+        config=cfg,
     )
 
     sampling_params = vllm.SamplingParams(
@@ -126,7 +123,7 @@ def sample_logits(
         prompt_logprobs=k,
         logprobs=k,
         flat_logprobs=True,
-        max_tokens=1,
+        max_tokens=1,  # we don't actually want any generated tokens but 1 is minimum
         detokenize=False,
         skip_special_tokens=False,
     )
@@ -232,7 +229,6 @@ def process_prompt_logprobs(
                 (0, 0), dtype=torch.float32
             )
 
-        # Pre-allocate on CUDA directly and use vectorized operations
         top_indices = torch.empty(
             (num_prompt_tokens, k), dtype=torch.long, device="cpu"
         )
