@@ -61,7 +61,6 @@ def sparse_kl_div_inner(
 
     # Terms for non-zero target probabilities
     teacher_sparse_probs = torch.exp(sparse_target_logprobs.float())
-    teacher_prob_sum = teacher_sparse_probs.to(torch.float32).sum(dim=-1)
     inner_sum = torch.sum(
         teacher_sparse_probs
         * (sparse_target_logprobs - sparse_student_logprobs.float()),
