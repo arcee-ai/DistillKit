@@ -230,6 +230,7 @@ def load_student_model(
             LOG.info(
                 f"Resized model vocab size from {model_vocab_size} to {new_model_vocab_size}"
             )
+    LOG.debug(f"Model vocab size: {model.get_input_embeddings().weight.shape[0]}")
 
     model: transformers.PreTrainedModel
     if config.frozen_modules:
@@ -410,5 +411,5 @@ def main(config_path: str, verbosity: int):
 
 
 if __name__ == "__main__":
-    # torch.autograd.set_detect_anomaly(True)
+    torch.autograd.set_detect_anomaly(True)
     main()
