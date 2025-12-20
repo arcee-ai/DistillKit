@@ -14,12 +14,27 @@ from distillkit.lossfuncs.common import (
 from distillkit.signals import DenseSignal, TeacherSignal
 
 
+def log1mexp(x: torch.Tensor) -> torch.Tensor:
+    """Compute log(1 - exp(x)) in a numerically stable way."""
+    mask = x > -1
+    result = torch.empty_like(x)
+    result[mask] = torch.log(-torch.expm1(x[mask]))
+    result[~mask] = torch.log1p(-torch.exp(x[~mask]))
+    return result
+
+
+def log_missing_prob(sparse_logprobs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    log_prob_sum = torch.logsumexp(sparse_logprobs.float(), dim=-1)
+    log_prob_sum = log_prob_sum.clamp(max=-eps)
+    return log1mexp(log_prob_sum)
+
+
 def sparse_kl_div_inner(
     logits: torch.Tensor,
     target_ids: torch.LongTensor,
     target_values: torch.Tensor,
     mask: torch.Tensor | None = None,
-    eps: float = 1e-8,
+    eps: float = 1e-6,
     missing: MissingProbabilityHandling = MissingProbabilityHandling.ZERO,
     log_target: bool = True,
     temperature: float = 1.0,
@@ -45,33 +60,35 @@ def sparse_kl_div_inner(
     )
 
     # Terms for non-zero target probabilities
-    teacher_sparse_probs = torch.exp(sparse_target_logprobs)
+    teacher_sparse_probs = torch.exp(sparse_target_logprobs.float())
     teacher_prob_sum = teacher_sparse_probs.to(torch.float32).sum(dim=-1)
     inner_sum = torch.sum(
-        teacher_sparse_probs * (sparse_target_logprobs - sparse_student_logprobs),
+        teacher_sparse_probs
+        * (sparse_target_logprobs - sparse_student_logprobs.float()),
         dim=-1,
     )
-    del sparse_target_logprobs, teacher_sparse_probs
 
     # Compute the contribution of missing logits to KL divergence
     if missing == MissingProbabilityHandling.SYMMETRIC_UNIFORM:
         # if the teacher's logprobs don't sum to 1, we assume the remaining
         # probability mass in *both* the teacher and student is distributed
         # uniformly over the token indices missing from the teacher's distribution
-        log_teacher_missing = torch.log1p(-teacher_prob_sum.clamp(min=eps, max=1 - eps))
-        student_probs = sparse_student_logprobs.to(torch.float32).exp_()
-        student_prob_sum = student_probs.sum(dim=-1)
-        del student_probs
-        log_student_missing = torch.log1p(-student_prob_sum.clamp(min=eps, max=1 - eps))
-        del student_prob_sum
-        missing_kl = torch.exp(log_teacher_missing) * (
-            log_teacher_missing - log_student_missing
+
+        log_teacher_missing = log_missing_prob(sparse_target_logprobs, eps=eps)
+        log_student_missing = log_missing_prob(sparse_student_logprobs, eps=eps)
+        log_ratio = log_teacher_missing - log_student_missing
+
+        teacher_missing_prob = torch.exp(log_teacher_missing)
+
+        missing_kl = torch.where(
+            teacher_missing_prob > eps,
+            teacher_missing_prob * log_ratio,
+            torch.zeros_like(teacher_missing_prob),
         )
     else:
         # in this case we assume zero probability mass for missing tokens
         # in the teacher distribution, and thus zero contribution to KL divergence
         missing_kl = None
-    del sparse_student_logprobs
 
     if mask is not None:
         if mask.dim() == 3:
@@ -79,7 +96,6 @@ def sparse_kl_div_inner(
         inner_sum *= mask
         if missing_kl is not None:
             missing_kl *= mask
-        del mask
 
     if missing_kl is not None:
         inner_sum += missing_kl
@@ -92,7 +108,7 @@ def sparse_kl_div(
     target_ids: torch.LongTensor,
     target_values: torch.Tensor,
     mask: torch.Tensor | None = None,
-    eps: float = 1e-8,
+    eps: float = 1e-6,
     missing: MissingProbabilityHandling = MissingProbabilityHandling.ZERO,
     log_target: bool = True,
     temperature: float = 1.0,
