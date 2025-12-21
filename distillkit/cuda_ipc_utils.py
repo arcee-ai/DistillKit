@@ -74,8 +74,8 @@ def deserialize_cuda_tensor(
     # Reconstruct storage from IPC handle
     # This is the critical zero-copy operation - creates a storage object
     # that references the same GPU memory as the sender's tensor
-    # The IPC handle is a tuple containing all necessary information
-    storage = torch.UntypedStorage._new_shared_cuda(ipc_handle)
+    # The IPC handle is a tuple that needs to be unpacked
+    storage = torch.UntypedStorage._new_shared_cuda(*ipc_handle)
 
     # Create typed storage
     typed_storage = torch.storage.TypedStorage(
