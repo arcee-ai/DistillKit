@@ -140,9 +140,7 @@ class VLLMOnlineSignalSource(SignalSource):
             )
 
         if not response.success:
-            raise RuntimeError(
-                f"Teacher inference failed: {response.error_message}"
-            )
+            raise RuntimeError(f"Teacher inference failed: {response.error_message}")
 
         # Reconstruct tensors from CUDA IPC handles
         device = input_ids.device

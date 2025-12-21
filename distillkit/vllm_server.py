@@ -16,12 +16,8 @@ try:
     from vllm.logprobs import FlatLogprobs, PromptLogprobs
 except ImportError:
     raise ImportError(
-        "vLLM must be installed to use the vLLM teacher. "
-        "Install with: pip install vllm"
+        "vLLM must be installed to use the vLLM teacher. Install with: pip install vllm"
     )
-
-# Import IPC utils - but this will import torch!
-# We need to defer this import as well
 
 LOG = logging.getLogger(__name__)
 
@@ -60,25 +56,34 @@ class TeacherResponse:
     error_message: str | None = None
 
 
-def process_prompt_logprobs(
-    prompt_logprobs: PromptLogprobs, k: int, device: "torch.device"
+def process_prompt_and_completion_logprobs(
+    prompt_logprobs: PromptLogprobs,
+    completion_logprobs: list,
+    k: int,
+    device: "torch.device",
 ) -> tuple["torch.Tensor", "torch.Tensor"]:
     """
-    Extract top-k logprobs from vLLM output.
+    Extract top-k logprobs from vLLM output, combining prompt and completion logprobs.
 
-    Adapted from sample_logits_vllm.py::process_prompt_logprobs() but returns
-    tensors on the specified GPU device instead of CPU.
+    For an input sequence of length N, we want N logprobs:
+    - prompt_logprobs[1:N] gives P(token[i] | token[:i]) for i=1..N-1
+    - completion_logprobs[0] gives P(generated_token | token[:N])
+
+    We shift prompt_logprobs by 1 and append the completion to align with
+    the teacher signal format expected by the loss functions.
 
     Args:
         prompt_logprobs: vLLM prompt logprobs output
+        completion_logprobs: vLLM completion logprobs output (list with 1 entry)
         k: Number of top-k logprobs
         device: CUDA device to place tensors on
 
     Returns:
-        (top_indices, top_values) tuple of tensors on GPU
+        (top_indices, top_values) tuple of tensors on GPU [seq_len, k]
     """
     import torch  # Import locally after CUDA_VISIBLE_DEVICES is set
 
+    # Process prompt logprobs (skipping first token which has no logprobs)
     # Fast path: FlatLogprobs (modern vLLM)
     if isinstance(prompt_logprobs, FlatLogprobs):
         # Skip first position if empty (first token has no logprobs)
@@ -96,7 +101,9 @@ def process_prompt_logprobs(
             )
 
         # Allocate on target GPU device directly
-        top_indices = torch.zeros((num_prompt_tokens, k), dtype=torch.long, device=device)
+        top_indices = torch.zeros(
+            (num_prompt_tokens, k), dtype=torch.long, device=device
+        )
         top_values = torch.full(
             (num_prompt_tokens, k),
             fill_value=float("-inf"),
@@ -137,14 +144,13 @@ def process_prompt_logprobs(
                 logprobs_to_copy, dtype=torch.float32, device=device
             )
 
-        return top_indices, top_values
+        prompt_ids = top_indices
+        prompt_values = top_values
 
     # Slow path: legacy list format (older vLLM versions)
     else:
         valid_logprobs = [lp for lp in prompt_logprobs]
-        if valid_logprobs and (
-            valid_logprobs[0] is None or len(valid_logprobs[0]) < 1
-        ):
+        if valid_logprobs and (valid_logprobs[0] is None or len(valid_logprobs[0]) < 1):
             valid_logprobs.pop(0)
 
         if not valid_logprobs:
@@ -153,7 +159,9 @@ def process_prompt_logprobs(
             )
 
         num_prompt_tokens = len(valid_logprobs)
-        top_indices = torch.zeros((num_prompt_tokens, k), dtype=torch.long, device=device)
+        top_indices = torch.zeros(
+            (num_prompt_tokens, k), dtype=torch.long, device=device
+        )
         top_values = torch.full(
             (num_prompt_tokens, k),
             fill_value=float("-inf"),
@@ -170,7 +178,48 @@ def process_prompt_logprobs(
                 top_indices[seq_id, logprob.rank - 1] = tok_id
                 top_values[seq_id, logprob.rank - 1] = logprob.logprob
 
-        return top_indices, top_values
+        prompt_ids = top_indices
+        prompt_values = top_values
+
+    # Now append the completion logprobs (the generated token's distribution)
+    # completion_logprobs is FlatLogprobs with 1 entry (we generated 1 token)
+    # When indexed with [0], it gives a dict: {token_id: Logprob object}
+    completion_row_ids = torch.zeros((1, k), dtype=torch.long, device=device)
+    completion_row_values = torch.full(
+        (1, k), fill_value=float("-inf"), dtype=torch.float32, device=device
+    )
+
+    if completion_logprobs and len(completion_logprobs) > 0:
+        completion_dict = completion_logprobs[0]  # First generated token's logprobs
+        if completion_dict is not None and isinstance(completion_dict, dict):
+            # completion_dict maps token_id -> Logprob object
+            num_filled = 0
+            for tok_id, logprob_obj in completion_dict.items():
+                # logprob_obj should have .rank and .logprob attributes
+                if hasattr(logprob_obj, "rank") and hasattr(logprob_obj, "logprob"):
+                    rank = logprob_obj.rank
+                    logprob = logprob_obj.logprob
+                elif isinstance(logprob_obj, dict):
+                    rank = logprob_obj.get("rank")
+                    logprob = logprob_obj.get("logprob")
+                else:
+                    # Skip if we can't parse it
+                    continue
+
+                if rank is None or rank > k:
+                    continue
+
+                # Convert token_id to int if it's not already
+                tok_id_int = tok_id if isinstance(tok_id, int) else int(tok_id)
+                completion_row_ids[0, rank - 1] = tok_id_int
+                completion_row_values[0, rank - 1] = logprob
+                num_filled += 1
+
+    # Concatenate: prompt_logprobs[1:] + completion
+    # This gives us logprobs aligned with the input sequence
+    final_ids = torch.cat([prompt_ids, completion_row_ids], dim=0)
+    final_values = torch.cat([prompt_values, completion_row_values], dim=0)
+    return final_ids, final_values
 
 
 class VLLMTeacherServer:
@@ -360,10 +409,14 @@ class VLLMTeacherServer:
 
             # Extract logprobs for each sequence in batch
             for batch_idx, output in enumerate(outputs):
-                seq_ids, seq_values = process_prompt_logprobs(
-                    output.prompt_logprobs, k, device
+                seq_ids, seq_values = process_prompt_and_completion_logprobs(
+                    output.prompt_logprobs,
+                    output.outputs[0].logprobs,  # First (and only) generated token
+                    k,
+                    device,
                 )
                 seq_len = seq_ids.shape[0]
+                input_len = len(request.input_ids[batch_idx])
                 sparse_ids[batch_idx, :seq_len] = seq_ids
                 sparse_values[batch_idx, :seq_len] = seq_values
 
@@ -371,10 +424,14 @@ class VLLMTeacherServer:
             self._cache_tensors(request.batch_hash, sparse_ids, sparse_values)
 
             # Create response with IPC handles
-            return self._create_response_from_tensors(request, sparse_ids, sparse_values)
+            return self._create_response_from_tensors(
+                request, sparse_ids, sparse_values
+            )
 
         except Exception as e:
-            LOG.error(f"Error processing request {request.request_id}: {e}", exc_info=True)
+            LOG.error(
+                f"Error processing request {request.request_id}: {e}", exc_info=True
+            )
             return TeacherResponse(
                 request_id=request.request_id,
                 batch_hash=request.batch_hash,

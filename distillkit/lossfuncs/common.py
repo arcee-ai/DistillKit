@@ -87,7 +87,7 @@ def get_logprobs(
     logits: torch.Tensor,
     target_ids: torch.LongTensor,
     target_values: torch.Tensor,
-    eps: float = 1e-8,
+    eps: float = 1e-6,
     missing: MissingProbabilityHandling = MissingProbabilityHandling.ZERO,
     log_target: bool = True,
     distillation_temperature: float = 1.0,
