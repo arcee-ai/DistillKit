@@ -7,7 +7,9 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import torch
+# NOTE: Do NOT import torch at module level!
+# CUDA_VISIBLE_DEVICES must be set before torch imports CUDA
+# Torch will be imported inside _initialize_vllm() after setting env var
 
 try:
     import vllm
@@ -18,7 +20,8 @@ except ImportError:
         "Install with: pip install vllm"
     )
 
-from distillkit.cuda_ipc_utils import serialize_cuda_tensor
+# Import IPC utils - but this will import torch!
+# We need to defer this import as well
 
 LOG = logging.getLogger(__name__)
 
@@ -58,8 +61,8 @@ class TeacherResponse:
 
 
 def process_prompt_logprobs(
-    prompt_logprobs: PromptLogprobs, k: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
+    prompt_logprobs: PromptLogprobs, k: int, device: "torch.device"
+) -> tuple["torch.Tensor", "torch.Tensor"]:
     """
     Extract top-k logprobs from vLLM output.
 
@@ -74,6 +77,8 @@ def process_prompt_logprobs(
     Returns:
         (top_indices, top_values) tuple of tensors on GPU
     """
+    import torch  # Import locally after CUDA_VISIBLE_DEVICES is set
+
     # Fast path: FlatLogprobs (modern vLLM)
     if isinstance(prompt_logprobs, FlatLogprobs):
         # Skip first position if empty (first token has no logprobs)
@@ -210,7 +215,7 @@ class VLLMTeacherServer:
 
         # Tensor cache to keep tensors alive for IPC
         # Maps batch_hash -> (sparse_ids, sparse_values, timestamp)
-        self.tensor_cache: dict[str, tuple[torch.Tensor, torch.Tensor, float]] = {}
+        self.tensor_cache: dict[str, tuple[Any, Any, float]] = {}
         self.cache_size_limit = config["cache_size_mb"] * 1024 * 1024
 
     def run(self):
@@ -259,10 +264,13 @@ class VLLMTeacherServer:
         isolate teacher from student GPUs. This only works because we use
         spawn context for multiprocessing, which starts a fresh Python process.
         """
-        # Set CUDA_VISIBLE_DEVICES to teacher GPUs BEFORE importing torch.cuda
+        # Set CUDA_VISIBLE_DEVICES to teacher GPUs BEFORE importing torch
         teacher_gpus = self.config["teacher_gpu_ids"]
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, teacher_gpus))
         LOG.info(f"Teacher server using GPUs: {teacher_gpus}")
+
+        # NOW safe to import torch (CUDA will see only teacher GPUs)
+        import torch  # noqa: F401
 
         # Now safe to initialize vLLM
         self.llm = vllm.LLM(
@@ -308,6 +316,8 @@ class VLLMTeacherServer:
         Returns:
             Response with CUDA IPC handles or error
         """
+        import torch  # Import locally after CUDA_VISIBLE_DEVICES is set
+
         try:
             # Check cache first
             if request.batch_hash in self.tensor_cache:
@@ -381,10 +391,12 @@ class VLLMTeacherServer:
     def _create_response_from_tensors(
         self,
         request: TeacherRequest,
-        sparse_ids: torch.Tensor,
-        sparse_values: torch.Tensor,
+        sparse_ids: "torch.Tensor",
+        sparse_values: "torch.Tensor",
     ) -> TeacherResponse:
         """Create response with CUDA IPC handles from tensors."""
+        from distillkit.cuda_ipc_utils import serialize_cuda_tensor
+
         ids_handle, ids_meta = serialize_cuda_tensor(sparse_ids)
         values_handle, values_meta = serialize_cuda_tensor(sparse_values)
 
@@ -401,7 +413,7 @@ class VLLMTeacherServer:
         )
 
     def _cache_tensors(
-        self, batch_hash: str, sparse_ids: torch.Tensor, sparse_values: torch.Tensor
+        self, batch_hash: str, sparse_ids: "torch.Tensor", sparse_values: "torch.Tensor"
     ):
         """
         Cache tensors to keep them alive for CUDA IPC.
@@ -430,6 +442,8 @@ class VLLMTeacherServer:
 
     def _cleanup(self):
         """Cleanup resources on shutdown."""
+        import torch
+
         LOG.info("Shutting down teacher server")
         self.tensor_cache.clear()
         if self.llm is not None:
