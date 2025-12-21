@@ -71,23 +71,11 @@ def deserialize_cuda_tensor(
     if target_device is None:
         target_device = torch.device(f"cuda:{metadata['device']}")
 
-    # Calculate storage size in bytes
-    # Use element_size from metadata if available (added in serialize fix)
-    if "element_size" in metadata:
-        storage_size = metadata["numel"] * metadata["element_size"]
-    else:
-        dtype_size = torch._utils._element_size(metadata["dtype"])
-        storage_size = metadata["numel"] * dtype_size
-
     # Reconstruct storage from IPC handle
     # This is the critical zero-copy operation - creates a storage object
     # that references the same GPU memory as the sender's tensor
-    # Note: _new_shared_cuda takes positional args, not keyword args
-    storage = torch.UntypedStorage._new_shared_cuda(
-        ipc_handle,
-        storage_size,
-        target_device,
-    )
+    # The IPC handle is a tuple containing all necessary information
+    storage = torch.UntypedStorage._new_shared_cuda(ipc_handle)
 
     # Create typed storage
     typed_storage = torch.storage.TypedStorage(
