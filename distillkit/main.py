@@ -288,55 +288,72 @@ def create_signal_source(
         # This ensures teacher server can set CUDA_VISIBLE_DEVICES before CUDA init
         mp_ctx = mp.get_context("spawn")
 
-        # Create IPC primitives
-        request_queue = mp_ctx.Queue(maxsize=16)
-        response_queue = mp_ctx.Queue(maxsize=16)
-        ready_event = mp_ctx.Event()
-        shutdown_event = mp_ctx.Event()
+        # Use a Manager for queues that can be shared across torchrun-spawned processes
+        # This allows all training ranks to communicate with a single teacher server
+        manager = mp_ctx.Manager()
+        request_queue = manager.Queue(maxsize=16)
+        response_queue = manager.Queue(maxsize=16)
+        ready_event = manager.Event()
+        shutdown_event = manager.Event()
 
-        # Serialize config for subprocess
-        config_dict = {
-            "model_path": config.teacher.model_path,
-            "top_k": config.teacher.top_k,
-            "teacher_gpu_ids": config.teacher.teacher_gpu_ids,
-            "tensor_parallel_size": config.teacher.tensor_parallel_size,
-            "dtype": config.teacher.dtype,
-            "quantization": config.teacher.quantization,
-            "gpu_memory_utilization": config.teacher.gpu_memory_utilization,
-            "max_model_len": config.teacher.max_model_len,
-            "trust_remote_code": config.teacher.trust_remote_code,
-            "cache_size_mb": config.teacher.cache_size_mb,
-        }
+        # Only spawn server from main process (rank 0)
+        # Check for distributed training via environment variables
+        import os
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-        # Create teacher server instance
-        server = VLLMTeacherServer(
-            config=config_dict,
-            request_queue=request_queue,
-            response_queue=response_queue,
-            ready_event=ready_event,
-            shutdown_event=shutdown_event,
-        )
+        server_process = None
+        if local_rank == 0:
+            # Serialize config for subprocess
+            config_dict = {
+                "model_path": config.teacher.model_path,
+                "top_k": config.teacher.top_k,
+                "teacher_gpu_ids": config.teacher.teacher_gpu_ids,
+                "tensor_parallel_size": config.teacher.tensor_parallel_size,
+                "dtype": config.teacher.dtype,
+                "quantization": config.teacher.quantization,
+                "gpu_memory_utilization": config.teacher.gpu_memory_utilization,
+                "max_model_len": config.teacher.max_model_len,
+                "trust_remote_code": config.teacher.trust_remote_code,
+                "cache_size_mb": config.teacher.cache_size_mb,
+            }
 
-        # Start server process
-        LOG.info(f"Starting vLLM teacher server on GPUs {config.teacher.teacher_gpu_ids}...")
-        server_process = mp_ctx.Process(target=server.run, daemon=False)
-        server_process.start()
-
-        # Wait for server to initialize
-        if not ready_event.wait(timeout=120):
-            server_process.terminate()
-            server_process.join()
-            raise RuntimeError(
-                "vLLM teacher server failed to initialize within 120 seconds. "
-                "Check that the model can be loaded and GPUs are available."
+            # Create teacher server instance
+            server = VLLMTeacherServer(
+                config=config_dict,
+                request_queue=request_queue,
+                response_queue=response_queue,
+                ready_event=ready_event,
+                shutdown_event=shutdown_event,
             )
-        LOG.info("vLLM teacher server ready")
 
-        # Create signal source
+            # Start server process
+            LOG.info(f"Starting vLLM teacher server on GPUs {config.teacher.teacher_gpu_ids}...")
+            server_process = mp_ctx.Process(target=server.run, daemon=False)
+            server_process.start()
+
+            # Wait for server to initialize
+            if not ready_event.wait(timeout=120):
+                server_process.terminate()
+                server_process.join()
+                raise RuntimeError(
+                    "vLLM teacher server failed to initialize within 120 seconds. "
+                    "Check that the model can be loaded and GPUs are available."
+                )
+            LOG.info("vLLM teacher server ready")
+        else:
+            # Non-main ranks wait for server to be ready
+            LOG.info(f"Rank {local_rank} waiting for teacher server from rank 0...")
+            if not ready_event.wait(timeout=120):
+                raise RuntimeError(
+                    f"Rank {local_rank}: Teacher server failed to become ready within 120 seconds"
+                )
+            LOG.info(f"Rank {local_rank}: Teacher server ready")
+
+        # All ranks create signal source connected to the same server
         signal_source = VLLMOnlineSignalSource(
             vocab_size=vocab_size,
             top_k=config.teacher.top_k,
-            server_process=server_process,
+            server_process=server_process,  # Only rank 0 has non-None
             request_queue=request_queue,
             response_queue=response_queue,
             shutdown_event=shutdown_event,

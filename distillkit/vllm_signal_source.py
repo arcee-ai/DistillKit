@@ -198,6 +198,7 @@ class VLLMOnlineSignalSource(SignalSource):
         Shutdown teacher server gracefully.
 
         Should be called when training completes to clean up resources.
+        Only rank 0 (which spawned the server) will actually shutdown the process.
         """
         hit_rate = (
             self.cache_hits / (self.cache_hits + self.cache_misses)
@@ -208,6 +209,11 @@ class VLLMOnlineSignalSource(SignalSource):
             f"vLLM teacher stats: {self.cache_hits} hits, {self.cache_misses} misses "
             f"(hit rate: {hit_rate:.1%})"
         )
+
+        # Only shutdown if we own the server process (rank 0)
+        if self.server_process is None:
+            LOG.info("Non-main rank: not shutting down teacher server")
+            return
 
         LOG.info("Shutting down teacher server...")
         self.shutdown_event.set()
