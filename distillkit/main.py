@@ -2,6 +2,7 @@
 import hashlib
 import json
 import logging
+import multiprocessing as mp
 import os
 import re
 from typing import Any
@@ -23,6 +24,7 @@ from distillkit.configuration import (
     LocalDataset,
     TeacherDatasetConfig,
     TeacherModelConfig,
+    TeacherVLLMConfig,
 )
 from distillkit.hsd_mapping import HiddenStateMapping
 from distillkit.monkey_patch_packing import monkey_patch_packing_for_model
@@ -251,20 +253,98 @@ def load_student_model(
 
 def create_signal_source(
     config: DistillationRunConfig, vocab_size: int
-) -> SignalSource:
+) -> tuple[SignalSource, mp.Process | None]:
+    """
+    Create signal source for teacher.
+
+    Returns:
+        (signal_source, server_process) where server_process is None for
+        offline/HF teachers, or the vLLM server process for vLLM teacher.
+    """
     if isinstance(config.teacher, TeacherDatasetConfig):
         compressor = LogprobCompressor(
             config=config.teacher.logprob_compressor,
             legacy_config=config.teacher.legacy_logit_compression,
         )
-        return OfflineSignalSource(compressor, vocab_size=vocab_size)
+        return OfflineSignalSource(compressor, vocab_size=vocab_size), None
+
     elif isinstance(config.teacher, TeacherModelConfig):
         teacher_model = transformers.AutoModelForCausalLM.from_pretrained(
             config.teacher.path, **(config.teacher.kwargs or {})
         )
-        return OnlineSignalSource(
-            teacher_model, vocab_size=vocab_size, sparsify_top_k=config.teacher.top_k
+        return (
+            OnlineSignalSource(
+                teacher_model, vocab_size=vocab_size, sparsify_top_k=config.teacher.top_k
+            ),
+            None,
         )
+
+    elif isinstance(config.teacher, TeacherVLLMConfig):
+        # Import here to avoid circular dependency and to fail fast if vLLM not installed
+        from distillkit.vllm_server import VLLMTeacherServer
+        from distillkit.vllm_signal_source import VLLMOnlineSignalSource
+
+        # Use spawn context for clean CUDA isolation
+        # This ensures teacher server can set CUDA_VISIBLE_DEVICES before CUDA init
+        mp_ctx = mp.get_context("spawn")
+
+        # Create IPC primitives
+        request_queue = mp_ctx.Queue(maxsize=16)
+        response_queue = mp_ctx.Queue(maxsize=16)
+        ready_event = mp_ctx.Event()
+        shutdown_event = mp_ctx.Event()
+
+        # Serialize config for subprocess
+        config_dict = {
+            "model_path": config.teacher.model_path,
+            "top_k": config.teacher.top_k,
+            "teacher_gpu_ids": config.teacher.teacher_gpu_ids,
+            "tensor_parallel_size": config.teacher.tensor_parallel_size,
+            "dtype": config.teacher.dtype,
+            "quantization": config.teacher.quantization,
+            "gpu_memory_utilization": config.teacher.gpu_memory_utilization,
+            "max_model_len": config.teacher.max_model_len,
+            "trust_remote_code": config.teacher.trust_remote_code,
+            "cache_size_mb": config.teacher.cache_size_mb,
+        }
+
+        # Create teacher server instance
+        server = VLLMTeacherServer(
+            config=config_dict,
+            request_queue=request_queue,
+            response_queue=response_queue,
+            ready_event=ready_event,
+            shutdown_event=shutdown_event,
+        )
+
+        # Start server process
+        LOG.info(f"Starting vLLM teacher server on GPUs {config.teacher.teacher_gpu_ids}...")
+        server_process = mp_ctx.Process(target=server.run, daemon=False)
+        server_process.start()
+
+        # Wait for server to initialize
+        if not ready_event.wait(timeout=120):
+            server_process.terminate()
+            server_process.join()
+            raise RuntimeError(
+                "vLLM teacher server failed to initialize within 120 seconds. "
+                "Check that the model can be loaded and GPUs are available."
+            )
+        LOG.info("vLLM teacher server ready")
+
+        # Create signal source
+        signal_source = VLLMOnlineSignalSource(
+            vocab_size=vocab_size,
+            top_k=config.teacher.top_k,
+            server_process=server_process,
+            request_queue=request_queue,
+            response_queue=response_queue,
+            shutdown_event=shutdown_event,
+            request_timeout_sec=config.teacher.request_timeout_sec,
+        )
+
+        return signal_source, server_process
+
     else:
         raise RuntimeError("Teacher configuration invalid")
 
@@ -325,47 +405,59 @@ def do_distill(config: DistillationRunConfig, config_source: str | None = None):
         dataset_kwargs=dataset_kwargs,
     )
 
-    signal_source = create_signal_source(config, tokenizer_vocab_size)
-    if config.layer_mapping is not None:
-        if not isinstance(signal_source, OnlineSignalSource):
-            raise RuntimeError(
-                "Hidden state distillation not supported for offline teachers"
+    signal_source, server_process = create_signal_source(config, tokenizer_vocab_size)
+
+    try:
+        if config.layer_mapping is not None:
+            if not isinstance(signal_source, OnlineSignalSource):
+                raise RuntimeError(
+                    "Hidden state distillation not supported for offline teachers"
+                )
+            teacher_hidden_size = signal_source.teacher_model.config.hidden_size
+            if config.layer_mapping == "all":
+                mapping = [(i, i) for i in range(model.config.num_hidden_layers)]
+            else:
+                mapping = config.layer_mapping
+            hsm = HiddenStateMapping(
+                student=model,
+                teacher_hidden_size=teacher_hidden_size,
+                layer_mapping=mapping,
+                force_projection=config.force_hidden_state_projection,
             )
-        teacher_hidden_size = signal_source.teacher_model.config.hidden_size
-        if config.layer_mapping == "all":
-            mapping = [(i, i) for i in range(model.config.num_hidden_layers)]
         else:
-            mapping = config.layer_mapping
-        hsm = HiddenStateMapping(
-            student=model,
-            teacher_hidden_size=teacher_hidden_size,
-            layer_mapping=mapping,
-            force_projection=config.force_hidden_state_projection,
+            hsm = None
+        trainer = DistillationTrainer(
+            model=model,
+            config=config,
+            signal_source=signal_source,
+            hidden_state_mapping=hsm,
+            true_vocab_size=tokenizer_vocab_size,
+            train_dataset=ds_train,
+            eval_dataset=ds_eval,
+            args=training_arguments,
+            data_collator=collate_packed_batch if config.dataset.prepacked else None,
+            processing_class=None if config.dataset.prepacked else tokenizer,
         )
-    else:
-        hsm = None
-    trainer = DistillationTrainer(
-        model=model,
-        config=config,
-        signal_source=signal_source,
-        hidden_state_mapping=hsm,
-        true_vocab_size=tokenizer_vocab_size,
-        train_dataset=ds_train,
-        eval_dataset=ds_eval,
-        args=training_arguments,
-        data_collator=collate_packed_batch if config.dataset.prepacked else None,
-        processing_class=None if config.dataset.prepacked else tokenizer,
-    )
 
-    resume_from_checkpoint = config.training_args.get("resume_from_checkpoint", None)
+        resume_from_checkpoint = config.training_args.get("resume_from_checkpoint", None)
 
-    LOG.info("Starting training.")
-    trainer.train(
-        resume_from_checkpoint=resume_from_checkpoint,
-    )
-    LOG.info(f"Finished training. Saving model to {config.output_path}.")
-    trainer.save_model(config.output_path)
-    LOG.info("Done.")
+        LOG.info("Starting training.")
+        trainer.train(
+            resume_from_checkpoint=resume_from_checkpoint,
+        )
+        LOG.info(f"Finished training. Saving model to {config.output_path}.")
+        trainer.save_model(config.output_path)
+        LOG.info("Done.")
+
+    finally:
+        # Clean up teacher server if running
+        if server_process is not None:
+            if hasattr(signal_source, "shutdown"):
+                signal_source.shutdown()
+            else:
+                LOG.warning("Signal source does not have shutdown method, terminating server")
+                server_process.terminate()
+                server_process.join()
 
 
 @click.command("distillkit-offline")

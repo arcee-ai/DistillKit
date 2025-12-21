@@ -1,0 +1,82 @@
+# Example configuration for vLLM-based online teacher distillation
+# This demonstrates how to use the new vLLM teacher with CUDA IPC
+
+project_name: distillkit-vllm-demo
+model: Qwen/Qwen2.5-1.5B  # Student model
+output_path: ./output/vllm_distill
+sequence_length: 2048
+
+dataset:
+  train_dataset:
+    repo_id: HuggingFaceH4/ultrachat_200k
+    split: train_sft
+  eval_dataset:
+    repo_id: HuggingFaceH4/ultrachat_200k
+    split: test_sft
+  seed: 42
+
+# vLLM teacher configuration
+teacher:
+  kind: vllm  # Use vLLM teacher (new!)
+  model_path: Qwen/Qwen2.5-7B  # Teacher model (larger than student)
+  top_k: 128  # Number of top-k logprobs (sparse signal)
+
+  # GPU allocation - CRITICAL for performance
+  # Example: If you have 4 GPUs (0,1,2,3):
+  # - Student training uses GPUs 0,1,2 (via torchrun --nproc_per_node=3)
+  # - Teacher uses GPU 3 (isolated in separate process)
+  teacher_gpu_ids: [3]
+
+  # vLLM settings
+  tensor_parallel_size: 1  # 1 for single GPU, 2+ for multi-GPU teacher
+  dtype: bfloat16
+  gpu_memory_utilization: 0.9
+  max_model_len: 2048
+
+  # Performance tuning
+  cache_size_mb: 2048  # Teacher server tensor cache
+  request_timeout_sec: 60.0
+
+# Loss functions
+loss_functions:
+  - function: cross_entropy
+    weight: 0.3
+  - function: kl
+    weight: 0.7
+    temperature: 2.0
+    missing_probability_handling: zero  # Handle missing probs in sparse signal
+    sparse_chunk_length: 1024  # Memory optimization for long sequences
+
+# Training configuration
+training_args:
+  num_train_epochs: 1
+  per_device_train_batch_size: 2  # Can use larger batches than OnlineSignalSource!
+  gradient_accumulation_steps: 4
+  learning_rate: 5.0e-6
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.1
+
+  # Optimization
+  bf16: true
+  gradient_checkpointing: true
+  optim: adamw_torch_fused
+
+  # Logging
+  logging_steps: 10
+  eval_strategy: steps
+  eval_steps: 100
+  save_strategy: steps
+  save_steps: 500
+  save_total_limit: 2
+
+  # WandB (optional)
+  report_to: wandb
+
+# How to run:
+# CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=3 -m distillkit.main examples/vllm_teacher_example.yml
+#
+# Explanation:
+# - All 4 GPUs are visible to the main process
+# - torchrun spawns 3 training ranks for student (will use GPUs 0,1,2)
+# - Teacher server uses GPU 3 (set via teacher_gpu_ids)
+# - The server process sets CUDA_VISIBLE_DEVICES=3 internally before loading vLLM

@@ -140,6 +140,57 @@ class TeacherDatasetConfig(BaseModel):
     )
 
 
+class TeacherVLLMConfig(BaseModel):
+    kind: Literal["vllm"] = "vllm"
+
+    model_path: str = Field(
+        description="HuggingFace model path for vLLM teacher.",
+    )
+    top_k: int = Field(
+        description="Number of top-k logprobs to return (sparse signal). "
+        "vLLM has linear performance degradation with number of logprobs, "
+        "so use moderate values (32-128 recommended).",
+    )
+    teacher_gpu_ids: list[int] = Field(
+        description="GPU IDs for teacher server (e.g., [3] or [3, 4] for tensor parallelism). "
+        "These GPUs must be visible to the process but separate from student training GPUs.",
+    )
+
+    tensor_parallel_size: int = Field(
+        default=1,
+        description="vLLM tensor parallelism degree. Should match len(teacher_gpu_ids).",
+    )
+    dtype: str | None = Field(
+        default="bfloat16",
+        description="Model dtype (auto, bfloat16, float16, float32).",
+    )
+    quantization: str | None = Field(
+        default=None,
+        description="vLLM quantization method (awq, gptq, squeezellm, etc.).",
+    )
+    gpu_memory_utilization: float = Field(
+        default=0.9,
+        description="Fraction of GPU memory to use for vLLM (0.0-1.0).",
+    )
+    max_model_len: int | None = Field(
+        default=None,
+        description="Maximum sequence length for vLLM. None uses model's default.",
+    )
+    trust_remote_code: bool = Field(
+        default=False,
+        description="Whether to trust remote code when loading model.",
+    )
+
+    cache_size_mb: int = Field(
+        default=2048,
+        description="Maximum cache size in MB for teacher server tensor cache.",
+    )
+    request_timeout_sec: float = Field(
+        default=60.0,
+        description="Timeout in seconds for teacher inference requests.",
+    )
+
+
 class DistillationRunConfig(BaseModel):
     project_name: str = Field(
         default="distillkit",
@@ -150,7 +201,7 @@ class DistillationRunConfig(BaseModel):
         alias="model",
     )
     dataset: DatasetConfiguration
-    teacher: TeacherModelConfig | TeacherDatasetConfig = Field(
+    teacher: TeacherModelConfig | TeacherDatasetConfig | TeacherVLLMConfig = Field(
         ..., discriminator="kind"
     )
     sequence_length: int = Field(

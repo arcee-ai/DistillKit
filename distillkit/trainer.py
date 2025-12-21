@@ -55,10 +55,15 @@ class DistillationTrainer(SFTTrainer):
                 "Must define a hidden state mapping to use hidden state losses."
             )
 
+        # Move HF teacher models to accelerator device
+        # VLLMOnlineSignalSource manages its own GPUs via server process
         if isinstance(self.signal_source, OnlineSignalSource):
-            self.signal_source.teacher_model = self.signal_source.teacher_model.to(
-                self.accelerator.device
-            )
+            from distillkit.vllm_signal_source import VLLMOnlineSignalSource
+
+            if not isinstance(self.signal_source, VLLMOnlineSignalSource):
+                self.signal_source.teacher_model = self.signal_source.teacher_model.to(
+                    self.accelerator.device
+                )
 
         self.model_accepts_loss_kwargs = False
 
