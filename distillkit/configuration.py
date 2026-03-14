@@ -9,6 +9,7 @@ from distillkit.compression.config import (
     DistributionQuantizationConfig,
     LegacyLogitCompressionConfig,
 )
+from distillkit.missing_probability import MissingProbabilityHandling
 
 
 class LossFunction(str, Enum):
@@ -20,11 +21,6 @@ class LossFunction(str, Enum):
     LOGISTIC_RANKING = "logistic_ranking"
     HIDDEN_STATE_COSINE = "hs_cosine"
     HIDDEN_STATE_MSE = "hs_mse"
-
-
-class MissingProbabilityHandling(Enum):
-    ZERO = "zero"
-    SYMMETRIC_UNIFORM = "symmetric_uniform"
 
 
 class LossFunctionConfig(BaseModel):

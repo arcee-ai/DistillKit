@@ -1,4 +1,4 @@
-from distillkit.lossfuncs.common import LossFunctionBase, MissingProbabilityHandling
+from distillkit.lossfuncs.common import LossFunctionBase
 from distillkit.lossfuncs.cross_entropy import CrossEntropyLoss
 from distillkit.lossfuncs.hidden_state import HiddenStateCosineLoss, HiddenStateMSELoss
 from distillkit.lossfuncs.hingeloss import HingeLoss, sparse_hinge_loss
@@ -9,6 +9,7 @@ from distillkit.lossfuncs.logistic_ranking import (
     sparse_logistic_ranking_loss,
 )
 from distillkit.lossfuncs.tvd import TVDLoss, sparse_tvd
+from distillkit.missing_probability import MissingProbabilityHandling
 
 ALL_LOSS_CLASSES = [
     KLDLoss,

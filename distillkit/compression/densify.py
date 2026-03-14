@@ -1,6 +1,6 @@
 import torch
 
-from distillkit.configuration import MissingProbabilityHandling
+from distillkit.missing_probability import MissingProbabilityHandling
 
 
 def densify(

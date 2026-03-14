@@ -6,8 +6,8 @@ from typing import Callable
 import torch
 from transformers.modeling_outputs import CausalLMOutput
 
-from distillkit.configuration import MissingProbabilityHandling
 from distillkit.hsd_mapping import HiddenStateMapping
+from distillkit.missing_probability import MissingProbabilityHandling
 from distillkit.signals import TeacherSignal
 
 
