@@ -49,7 +49,7 @@ class QuantizationBin(BaseModel):
         ...,
         description="Number of bits per element.",
         gt=0,
-        lte=64,
+        le=64,
     )
     num_elements: int = Field(
         ...,
